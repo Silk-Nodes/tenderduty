@@ -3,11 +3,8 @@
 Advisories reported by `govulncheck ./...` that are accepted rather than fixed, with the reason and a date to
 look again. Anything not listed here blocks a release.
 
-Run the scan with:
-
-```
-docker run --rm -v "$PWD":/src -w /src golang:1.26 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-```
+`make vulncheck` runs the scan and fails on anything reachable that is not listed below. The same script runs in
+CI on every push and pull request and once a week, so a new advisory shows up as a failed run.
 
 | Advisory | Module | Reason it is accepted | Review by |
 |---|---|---|---|

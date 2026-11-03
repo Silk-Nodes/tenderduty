@@ -4,7 +4,6 @@ import (
 	"embed"
 	"encoding/json"
 	"github.com/gorilla/websocket"
-	"github.com/textileio/go-threads/broadcast"
 	"io/fs"
 	"log"
 	"net/http"
@@ -23,13 +22,48 @@ var (
 
 const logLength = 256
 
+// hub fans messages out to the connected dashboards. Each client has its own buffered channel, so a slow or dead
+// client loses messages rather than holding everyone else up; the next status message carries the full state.
+type hub struct {
+	mu   sync.Mutex
+	subs map[chan []byte]struct{}
+}
+
+func (h *hub) add() chan []byte {
+	ch := make(chan []byte, 64)
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.subs == nil {
+		h.subs = make(map[chan []byte]struct{})
+	}
+	h.subs[ch] = struct{}{}
+	return ch
+}
+
+func (h *hub) remove(ch chan []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.subs, ch)
+}
+
+func (h *hub) send(msg []byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for ch := range h.subs {
+		select {
+		case ch <- msg:
+		default:
+		}
+	}
+}
+
 func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLogs bool) {
 	var err error
 	rootDir, err = fs.Sub(Content, "static")
 	if err != nil {
 		log.Fatalln(err)
 	}
-	var cast broadcast.Broadcaster
+	cast := &hub{}
 
 	// cache the json .... don't serialize on-demand
 	logCache, statusCache := []byte{'[', ']'}, []byte{'{', '}'}
@@ -50,7 +84,7 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 			select {
 			case <-tick.C:
 				if update {
-					_ = cast.Send(statusCache)
+					cast.send(statusCache)
 					update = false
 				}
 
@@ -100,7 +134,7 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 				if e != nil {
 					continue
 				}
-				_ = cast.Send(j)
+				cast.send(j)
 			}
 		}
 	}()
@@ -115,21 +149,39 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 			return
 		}
 		defer c.Close()
-		sub := cast.Listen()
-		defer sub.Discard()
+		sub := cast.add()
+		defer cast.remove(sub)
+		// the client sends nothing we use, but reading is what answers pings and notices a closed tab
+		gone := make(chan struct{})
+		go func() {
+			defer close(gone)
+			for {
+				if _, _, e := c.ReadMessage(); e != nil {
+					return
+				}
+			}
+		}()
+		write := func(msg []byte) error {
+			_ = c.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			return c.WriteMessage(websocket.TextMessage, msg)
+		}
 		// a fresh connection gets the current state at once rather than waiting for the next change
 		statusMux.Lock()
 		snapshot := statusCache
 		statusMux.Unlock()
 		if len(snapshot) > 0 {
-			if e := c.WriteMessage(websocket.TextMessage, snapshot); e != nil {
+			if e := write(snapshot); e != nil {
 				return
 			}
 		}
-		for message := range sub.Channel() {
-			e := c.WriteMessage(websocket.TextMessage, message.([]byte))
-			if e != nil {
+		for {
+			select {
+			case <-gone:
 				return
+			case message := <-sub:
+				if e := write(message); e != nil {
+					return
+				}
 			}
 		}
 	})
@@ -161,7 +213,6 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 		ReadHeaderTimeout: 3 * time.Second,
 	}
 	err = server.ListenAndServe()
-	cast.Discard()
 	log.Fatal("tenderduty dashboard server failed", err)
 }
 

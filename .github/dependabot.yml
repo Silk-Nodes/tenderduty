@@ -1,0 +1,22 @@
+# Dependabot keeps patch releases flowing and leaves the chain stack alone: a new cosmos-sdk or CometBFT line
+# needs matching changes in the code and is taken by hand.
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      go-modules:
+        patterns: ["*"]
+    ignore:
+      - dependency-name: github.com/cosmos/cosmos-sdk
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: github.com/cometbft/cometbft
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+      - dependency-name: cosmossdk.io/*
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

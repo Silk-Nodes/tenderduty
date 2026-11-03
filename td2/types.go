@@ -17,9 +17,11 @@ import (
 	"sync"
 	"time"
 
-	dash "github.com/blockpane/tenderduty/v2/td2/dashboard"
-	"github.com/go-yaml/yaml"
-	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
+	upgrade "cosmossdk.io/x/upgrade/types"
+	dash "github.com/Silk-Nodes/tenderduty/v2/td2/dashboard"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	"github.com/gorilla/websocket"
+	"gopkg.in/yaml.v2"
 )
 
 const (
@@ -50,6 +52,8 @@ type Config struct {
 	NodeDownMin int `yaml:"node_down_alert_minutes"`
 	// NodeDownSeverity controls the Pagerduty severity when notifying if a node is down.
 	NodeDownSeverity string `yaml:"node_down_alert_severity"`
+	// LagBlocks is how many blocks a node may trail the best node before it is treated as down.
+	LagBlocks int `yaml:"lag_blocks"`
 
 	// Prom controls if the prometheus exporter is enabled.
 	Prom bool `yaml:"prometheus_enabled"`
@@ -84,8 +88,10 @@ type savedState struct {
 // validators can be monitored on a single chain.
 type ChainConfig struct {
 	name           string
-	wsclient       *TmConn       // custom websocket client to work around wss:// bugs in tendermint
+	clientMux      sync.Mutex // guards client and wsclient while they are being replaced
+	wsclient       *websocket.Conn
 	client         *rpchttp.HTTP // legit tendermint client
+	currentUrl     string        // the node the client is pointed at
 	noNodes        bool          // tracks if all nodes are down
 	valInfo        *ValInfo      // recent validator state, only refreshed every few minutes
 	lastValInfo    *ValInfo      // use for detecting newly-jailed/tombstone
@@ -94,7 +100,16 @@ type ChainConfig struct {
 	lastBlockTime  time.Time
 	lastBlockAlarm bool
 	lastBlockNum   int64
-	activeAlerts   int
+	avgBlockTime   float64 // seconds between blocks, smoothed
+
+	upgrade       *upgrade.Plan        // scheduled upgrade from x/upgrade, nil when none
+	upgradeKey    string               // name and height of the plan the current notices are about
+	upgradeAlarms [3]string            // text of each notice sent for the plan, empty when not sent
+	proposals     []proposalInfo       // proposals in their voting period
+	govAlarms     map[uint64]*govAlarm // reminders sent per proposal
+	govLegacy     bool                 // chain only answers gov v1beta1 queries
+	govErr        string               // last refresh problem, so it is logged once
+	stalledMsg    string               // text of the open stalled alert, so the resolve matches it
 
 	statTotalSigns      float64
 	statTotalProps      float64
@@ -109,12 +124,6 @@ type ChainConfig struct {
 	// ValAddress is the validator operator address to be monitored. Tenderduty v1 required the consensus address,
 	// this is no longer needed. The operator address is much easier to find in explorers etc.
 	ValAddress string `yaml:"valoper_address"`
-	// ValconsOverride allows skipping the lookup of the consensus public key and setting it directly.
-	ValconsOverride string `yaml:"valcons_override"`
-	// ExtraInfo will be appended to the alert data. This is useful for pagerduty because multiple tenderduty instances
-	// can be pointed at pagerduty and duplicate alerts will be filtered by using a key. The first alert will win, this
-	// can be useful for knowing what tenderduty instance sent the alert.
-	ExtraInfo string `yaml:"extra_info"` // FIXME not used yet!
 	// Alerts defines the types of alerts to send for this chain.
 	Alerts AlertConfig `yaml:"alerts"`
 	// PublicFallback determines if tenderduty should attempt to use public RPC endpoints in the situation that not
@@ -122,6 +131,101 @@ type ChainConfig struct {
 	PublicFallback bool `yaml:"public_fallback"`
 	// Nodes defines what RPC servers to connect to.
 	Nodes []*NodeConfig `yaml:"nodes"`
+}
+
+// rpcOnly reports whether the chain is monitored without a validator: node health, stalled detection and
+// upgrade alerts still apply, everything about signing, jailing and voting does not.
+func (cc *ChainConfig) rpcOnly() bool {
+	return cc.ValAddress == ""
+}
+
+// alertId is the de-duplication key for an alert: the validator's consensus address plus a suffix, or the
+// chain id when the chain is monitored without a validator.
+func (cc *ChainConfig) alertId(suffix string) *string {
+	// the operator address is known from the config, so the key is the same before and after the validator
+	// loads, and the same across instances that page the same PagerDuty service
+	id := cc.ChainId + suffix
+	if cc.ValAddress != "" {
+		id = cc.ValAddress + suffix
+	}
+	return &id
+}
+
+// healthyNodes counts the nodes that passed their last probe.
+func (cc *ChainConfig) healthyNodes() int {
+	n := 0
+	for _, node := range cc.Nodes {
+		if !node.down {
+			n++
+		}
+	}
+	return n
+}
+
+// pushStatus sends the chain's current state to the dashboard.
+func (cc *ChainConfig) pushStatus() {
+	if !td.EnableDash {
+		return
+	}
+	active := alarms.getCount(cc.name)
+	if cc.noNodes && active == 0 {
+		active = 1
+	}
+	nodes := make([]dash.NodeStatus, len(cc.Nodes))
+	for i, node := range cc.Nodes {
+		nodes[i] = dash.NodeStatus{
+			Name:    node.Url,
+			Up:      !node.down,
+			Active:  node.Url == cc.currentUrl,
+			Height:  node.height,
+			Lag:     node.lag,
+			Syncing: node.syncing,
+			Message: node.lastMsg,
+		}
+	}
+	var up *dash.UpgradeStatus
+	if cc.upgrade != nil {
+		up = &dash.UpgradeStatus{Name: cc.upgrade.Name, Height: cc.upgrade.Height, EtaSeconds: -1}
+		if eta, ok := cc.upgradeEta(); ok {
+			up.EtaSeconds = int64(eta.Seconds())
+		}
+	}
+	props := make([]dash.ProposalStatus, len(cc.proposals))
+	for i, p := range cc.proposals {
+		props[i] = dash.ProposalStatus{ID: p.ID, Title: p.Title, Ends: p.VotingEnd.Unix(), IsUpgrade: p.IsUpgrade, Voted: p.Voted}
+	}
+	var lastBlock int64
+	if !cc.lastBlockTime.IsZero() {
+		lastBlock = cc.lastBlockTime.Unix()
+	}
+	td.updateChan <- &dash.ChainStatus{
+		MsgType:        "status",
+		Name:           cc.name,
+		ChainId:        cc.ChainId,
+		Validator:      !cc.rpcOnly(),
+		Moniker:        cc.valInfo.Moniker,
+		Bonded:         cc.valInfo.Bonded,
+		Jailed:         cc.valInfo.Jailed,
+		Tombstoned:     cc.valInfo.Tombstoned,
+		Missed:         cc.valInfo.Missed,
+		Window:         cc.valInfo.Window,
+		JailAfter:      cc.valInfo.JailAfter,
+		Nodes:          len(cc.Nodes),
+		HealthyNodes:   cc.healthyNodes(),
+		ActiveAlerts:   active,
+		Height:         cc.lastBlockNum,
+		LastError:      cc.lastError,
+		LastBlock:      lastBlock,
+		AvgBlockTime:   cc.avgBlockTime,
+		StalledMinutes: cc.Alerts.Stalled,
+		Tokens:         cc.valInfo.Tokens,
+		VotingPowerPct: cc.valInfo.VotingPowerPct,
+		Upgrade:        up,
+		Proposals:      props,
+		NodeStatus:     nodes,
+		Alerts:         listAlarms(cc.name),
+		Blocks:         cc.blocksResults,
+	}
 }
 
 // mkUpdate returns the info needed by prometheus for a gauge.
@@ -162,6 +266,29 @@ type AlertConfig struct {
 	// AlertIfNoServers: should an alert be sent if no servers are reachable?
 	AlertIfNoServers bool `yaml:"alert_if_no_servers"`
 
+	// UpgradeAlerts: notify when x/upgrade has a scheduled plan, with reminders as the height approaches
+	UpgradeAlerts bool `yaml:"upgrade_enabled"`
+	// UpgradeNoticeHours: send a warning when the upgrade is estimated to be under this many hours away
+	UpgradeNoticeHours int `yaml:"upgrade_notice_hours"`
+	// UpgradeImminentMinutes: send the final notice when the upgrade is under this many minutes away
+	UpgradeImminentMinutes int `yaml:"upgrade_imminent_minutes"`
+	// UpgradePriority is the pagerduty severity of the final notice
+	UpgradePriority string `yaml:"upgrade_priority"`
+
+	// GovAlerts: remind when a proposal is in its voting period and the validator has not voted
+	GovAlerts bool `yaml:"governance_enabled"`
+	// GovFinalHours: send a second reminder when voting closes in under this many hours
+	GovFinalHours int `yaml:"governance_final_hours"`
+	// GovPriority is the pagerduty severity of governance reminders
+	GovPriority string `yaml:"governance_priority"`
+
+	// VotingPowerAlerts: notify when the delegated stake jumps or drops between two refreshes
+	VotingPowerAlerts bool `yaml:"voting_power_enabled"`
+	// VotingPowerChangePercent is the size of change, as a percentage of the previous stake, that triggers a notice
+	VotingPowerChangePercent float64 `yaml:"voting_power_change_percent"`
+	// VotingPowerPriority is the pagerduty severity of voting power notices
+	VotingPowerPriority string `yaml:"voting_power_priority"`
+
 	// PagerdutyAlerts: Should pagerduty alerts be sent for this chain? Both 'config.pagerduty.enabled: yes' and this must be set.
 	//Deprecated: use Pagerduty.Enabled instead
 	PagerdutyAlerts bool `yaml:"pagerduty_alerts"`
@@ -188,11 +315,14 @@ type NodeConfig struct {
 	Url         string `yaml:"url"`
 	AlertIfDown bool   `yaml:"alert_if_down"`
 
-	down      bool
-	wasDown   bool
-	syncing   bool
-	lastMsg   string
-	downSince time.Time
+	down       bool
+	wasDown    bool
+	syncing    bool
+	lastMsg    string
+	downSince  time.Time
+	height     int64     // last height the node reported
+	lag        int64     // blocks behind the best node at the last probe
+	wsFailedAt time.Time // when the websocket to this node last stopped delivering blocks
 }
 
 // PDConfig is the information required to send alerts to PagerDuty
@@ -200,28 +330,33 @@ type PDConfig struct {
 	Enabled         bool   `yaml:"enabled"`
 	ApiKey          string `yaml:"api_key"`
 	DefaultSeverity string `yaml:"default_severity"`
+	// SeverityThreshold is the lowest severity sent to this channel: info, warning, error or critical.
+	SeverityThreshold string `yaml:"severity_threshold"`
 }
 
 // DiscordConfig holds the information needed to publish to a Discord webhook for sending alerts
 type DiscordConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	Webhook  string   `yaml:"webhook"`
-	Mentions []string `yaml:"mentions"`
+	Enabled           bool     `yaml:"enabled"`
+	Webhook           string   `yaml:"webhook"`
+	Mentions          []string `yaml:"mentions"`
+	SeverityThreshold string   `yaml:"severity_threshold"`
 }
 
 // TeleConfig holds the information needed to publish to a Telegram webhook for sending alerts
 type TeleConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	ApiKey   string   `yaml:"api_key"`
-	Channel  string   `yaml:"channel"`
-	Mentions []string `yaml:"mentions"`
+	Enabled           bool     `yaml:"enabled"`
+	ApiKey            string   `yaml:"api_key"`
+	Channel           string   `yaml:"channel"`
+	Mentions          []string `yaml:"mentions"`
+	SeverityThreshold string   `yaml:"severity_threshold"`
 }
 
 // SlackConfig holds the information needed to publish to a Slack webhook for sending alerts
 type SlackConfig struct {
-	Enabled  bool     `yaml:"enabled"`
-	Webhook  string   `yaml:"webhook"`
-	Mentions []string `yaml:"mentions"`
+	Enabled           bool     `yaml:"enabled"`
+	Webhook           string   `yaml:"webhook"`
+	Mentions          []string `yaml:"mentions"`
+	SeverityThreshold string   `yaml:"severity_threshold"`
 }
 
 // HealthcheckConfig holds the information needed to send pings to a healthcheck endpoint
@@ -252,8 +387,26 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		}
 	}
 
+	if c.NodeDownSeverity == "" {
+		c.NodeDownSeverity = "critical"
+	}
 	if c.NodeDownMin < 3 {
 		problems = append(problems, "warning: setting 'node_down_alert_minutes' to less than three minutes might result in false alarms")
+	}
+	if c.LagBlocks <= 0 {
+		c.LagBlocks = 10
+	}
+	// pagerduty is for things that need a person, the chat channels get everything
+	if c.Pagerduty.SeverityThreshold == "" {
+		c.Pagerduty.SeverityThreshold = "warning"
+	}
+	for _, t := range []*string{&c.Discord.SeverityThreshold, &c.Telegram.SeverityThreshold, &c.Slack.SeverityThreshold} {
+		if *t == "" {
+			*t = "info"
+		}
+	}
+	if c.Healthcheck.Enabled && c.Healthcheck.PingRate <= 0 {
+		c.Healthcheck.PingRate = 60
 	}
 
 	var wantsPublic bool
@@ -272,6 +425,32 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		}
 
 		v.valInfo = &ValInfo{Moniker: "not connected"}
+		if v.rpcOnly() {
+			v.valInfo.Moniker = ""
+		}
+
+		// defaults for the newer alert types, so a config that only sets the enabled flag works
+		setDefault := func(n *int, d int) {
+			if *n <= 0 {
+				*n = d
+			}
+		}
+		setDefault(&v.Alerts.UpgradeNoticeHours, 24)
+		setDefault(&v.Alerts.UpgradeImminentMinutes, 60)
+		setDefault(&v.Alerts.GovFinalHours, 24)
+		if v.Alerts.VotingPowerChangePercent <= 0 {
+			v.Alerts.VotingPowerChangePercent = 10
+		}
+		// these are notices rather than incidents, so they stay below the pagerduty threshold unless raised
+		if v.Alerts.UpgradePriority == "" {
+			v.Alerts.UpgradePriority = "info"
+		}
+		if v.Alerts.GovPriority == "" {
+			v.Alerts.GovPriority = "info"
+		}
+		if v.Alerts.VotingPowerPriority == "" {
+			v.Alerts.VotingPowerPriority = "info"
+		}
 
 		// the bools for enabling alerts are deprecated with full configs preferred,
 		// don't break if someone is still using them:
@@ -305,6 +484,18 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			v.Alerts.Pagerduty.ApiKey = c.Pagerduty.ApiKey
 			v.Alerts.Pagerduty.DefaultSeverity = c.Pagerduty.DefaultSeverity
 		}
+		if v.Alerts.Pagerduty.SeverityThreshold == "" {
+			v.Alerts.Pagerduty.SeverityThreshold = c.Pagerduty.SeverityThreshold
+		}
+		if v.Alerts.Discord.SeverityThreshold == "" {
+			v.Alerts.Discord.SeverityThreshold = c.Discord.SeverityThreshold
+		}
+		if v.Alerts.Telegram.SeverityThreshold == "" {
+			v.Alerts.Telegram.SeverityThreshold = c.Telegram.SeverityThreshold
+		}
+		if v.Alerts.Slack.SeverityThreshold == "" {
+			v.Alerts.Slack.SeverityThreshold = c.Slack.SeverityThreshold
+		}
 
 		switch {
 		case v.Alerts.Slack.Enabled && !c.Slack.Enabled:
@@ -318,29 +509,14 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			fallthrough
 		case v.Alerts.Telegram.Enabled && !c.Telegram.Enabled:
 			problems = append(problems, fmt.Sprintf("warn: %20s is configured for telegram alerts, but it is not enabled", k))
-		case !v.Alerts.ConsecutiveAlerts && !v.Alerts.PercentageAlerts && !v.Alerts.AlertIfInactive && !v.Alerts.AlertIfNoServers:
+		case !v.Alerts.ConsecutiveAlerts && !v.Alerts.PercentageAlerts && !v.Alerts.AlertIfInactive && !v.Alerts.AlertIfNoServers &&
+			!v.Alerts.StalledAlerts && !v.Alerts.UpgradeAlerts && !v.Alerts.GovAlerts && !v.Alerts.VotingPowerAlerts:
 			problems = append(problems, fmt.Sprintf("warn: %20s has no alert types configured", k))
 			fallthrough
 		case !v.Alerts.Pagerduty.Enabled && !v.Alerts.Discord.Enabled && !v.Alerts.Telegram.Enabled && !v.Alerts.Slack.Enabled:
 			problems = append(problems, fmt.Sprintf("warn: %20s has no notifications configured", k))
 		}
-		if td.EnableDash {
-			td.updateChan <- &dash.ChainStatus{
-				MsgType:      "status",
-				Name:         v.name,
-				ChainId:      v.ChainId,
-				Moniker:      v.valInfo.Moniker,
-				Bonded:       v.valInfo.Bonded,
-				Jailed:       v.valInfo.Jailed,
-				Tombstoned:   v.valInfo.Tombstoned,
-				Missed:       v.valInfo.Missed,
-				Window:       v.valInfo.Window,
-				Nodes:        len(v.Nodes),
-				HealthyNodes: 0,
-				ActiveAlerts: 0,
-				Blocks:       v.blocksResults,
-			}
-		}
+		v.pushStatus()
 	}
 
 	// if public endpoints are enabled we do our best to keep the list refreshed. Immediate, then every 12 hours.
@@ -348,7 +524,7 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		go func() {
 			e := refreshRegistry()
 			if e != nil {
-				l("could not fetch chain registry paths, using defaults")
+				l("could not fetch chain registry paths, public fallback unavailable until the next refresh -", e)
 			}
 			for {
 				time.Sleep(12 * time.Hour)
@@ -482,7 +658,7 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 	// buffer enough to get through validateConfig()
 	c.updateChan = make(chan *dash.ChainStatus, len(c.Chains)*2)
 	c.statsChan = make(chan *promUpdate, len(c.Chains)*2)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ctx, c.cancel = context.WithCancel(context.Background()) // #nosec G118 -- cancel is kept on the config and called when Run returns
 
 	// handle cached data. FIXME: incomplete.
 	c.alarms = &alarmCache{
@@ -494,19 +670,11 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		notifyMux:     sync.RWMutex{},
 	}
 
-	//#nosec -- variable specified on command line
-	sf, e := os.OpenFile(stateFile, os.O_RDONLY, 0600)
-	if e != nil {
-		l("could not load saved state", e.Error())
-	}
-	b, e := io.ReadAll(sf)
-	_ = sf.Close()
-	if e != nil {
-		l("could not read saved state", e.Error())
-	}
 	saved := &savedState{}
-	e = json.Unmarshal(b, saved)
-	if e != nil {
+	//#nosec -- variable specified on command line
+	if b, e := os.ReadFile(stateFile); e != nil {
+		l("no saved state to restore:", e.Error())
+	} else if e = json.Unmarshal(b, saved); e != nil {
 		l("could not unmarshal saved state", e.Error())
 	}
 	for k, v := range saved.Blocks {
@@ -550,7 +718,6 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 						for j := range c.Chains[k].Nodes {
 							if c.Chains[k].Nodes[j].Url == nodeUrl {
 								c.Chains[k].Nodes[j].down = true
-								c.Chains[k].Nodes[j].wasDown = true
 								c.Chains[k].Nodes[j].downSince = v[nodeUrl]
 							}
 						}
@@ -585,6 +752,6 @@ func clearStale(alarms map[string]time.Time, what string, hasPagerduty bool, hou
 			delete(alarms, k)
 			continue
 		}
-		l("📂 restored %s alarm state -", what, k)
+		l(fmt.Sprintf("📂 restored %s alarm state - %s", what, k))
 	}
 }

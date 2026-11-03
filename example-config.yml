@@ -11,6 +11,8 @@ hide_logs: no
 node_down_alert_minutes: 3
 # Node Down alert Pagerduty Severity
 node_down_alert_severity: critical
+# How many blocks a node may trail the best node before it is treated as down and the websocket moves off it.
+lag_blocks: 10
 
 # Should the prometheus exporter be enabled?
 prometheus_enabled: yes
@@ -25,6 +27,10 @@ pagerduty:
   api_key: aaaaaaaaaaaabbbbbbbbbbbbbcccccccccccc
   # Not currently used, but will be soon. This allows setting escalation priorities etc.
   default_severity: alert
+  # Lowest severity that is sent to pagerduty: info, warning, error or critical. Defaults to warning, so the
+  # upgrade, governance and voting power notices (info) reach the chat channels but do not page anyone.
+  # Resolves always go through. Can be overridden per chain.
+  severity_threshold: warning
 
 # Discord settings
 discord:
@@ -32,6 +38,8 @@ discord:
   enabled: no
   # The webhook is set by right-clicking on a channel, editing the settings, and configuring a webhook in the intergrations section.
   webhook: https://discord.com/api/webhooks/999999999999999999/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+  # Lowest severity sent here, defaults to info (everything).
+  severity_threshold: info
 
 # Telegram settings
 telegram:
@@ -67,7 +75,9 @@ chains:
     chain_id: osmosis-1
     # Hooray, in v2 we derive the valcons from abci queries so you don't have to jump through hoops to figure out how
     # to convert ed25519 keys to the appropriate bech32 address.
-    # Use valcons address if using ICS
+    # Use valcons address if using ICS.
+    # Leave it out entirely for a chain where you run RPC nodes but no validator: node health, stalled chain and
+    # upgrade alerts still apply, signing and governance checks are skipped.
     valoper_address: osmovaloper1xxxxxxx...
     # Should the monitor revert to using public API endpoints if all supplied RCP nodes fail?
     # This isn't always reliable, not all public nodes have websocket proxying setup correctly.
@@ -101,6 +111,29 @@ chains:
       # Should an alert be sent if no RPC servers are responding? (Note this alarm is instantaneous with no delay)
       alert_if_no_servers: yes
 
+      # Scheduled software upgrades (from the x/upgrade module). Three notices are sent: when the plan appears,
+      # when it is under upgrade_notice_hours away, and when it is under upgrade_imminent_minutes away. The
+      # time is estimated from recent block times. All three resolve once the upgrade is applied or cancelled.
+      upgrade_enabled: yes
+      upgrade_notice_hours: 24
+      upgrade_imminent_minutes: 60
+      # Severity of the final notice (the first two are always info). Defaults to info, which stays below the
+      # pagerduty threshold; set it to critical if you want a page an hour before the upgrade.
+      upgrade_priority: info
+
+      # Governance: remind when a proposal is in its voting period and this validator has not voted, and again
+      # when under governance_final_hours remain. Resolves once the vote is cast or voting closes.
+      # Skipped on chains monitored by valcons address (consumer chains have no governance module).
+      governance_enabled: yes
+      governance_final_hours: 24
+      governance_priority: info
+
+      # Voting power: a one-off notice when the delegated stake moves by more than this percentage between two
+      # refreshes, about a minute apart. Catches a large delegation or undelegation, not a slow drain.
+      voting_power_enabled: yes
+      voting_power_change_percent: 10
+      voting_power_priority: info
+
       # for this *specific* chain it's possible to override alert settings. If the api_key or webhook addresses are empty,
       # the global settings will be used. Note, enabled must be set both globally and for each chain.
 
@@ -125,13 +158,32 @@ chains:
         enabled: yes
         webhook: "" # uses default if blank
 
-    # This section covers our RPC providers. No LCD (aka REST) endpoints are used, only TM's RPC endpoints
-    # Multiple hosts are encouraged, and will be tried sequentially until a working endpoint is discovered.
+    # This section covers our RPC providers. No LCD (aka REST) endpoints are used, only TM's RPC endpoints.
+    # Multiple hosts are encouraged. All of them are probed at once and the one with the highest block height is
+    # used. If it goes down, falls more than lag_blocks behind, or stops delivering blocks over its websocket,
+    # the next best node takes over within about a minute.
     nodes:
       # URL for the endpoint. Must include protocol://hostname:port
       - url: tcp://localhost:26657
         # Should we send an alert if this host isn't responding?
         alert_if_down: yes
       # repeat hosts for monitoring redundancy
+      - url: https://some-other-node:443
+        alert_if_down: no
+
+  # A chain where you run RPC nodes but no validator. Leave out valoper_address and only the node health,
+  # stalled chain and upgrade checks apply. It is listed below the validators on the dashboard.
+  "Juno RPC":
+    chain_id: juno-1
+    alerts:
+      stalled_enabled: yes
+      stalled_minutes: 10
+      upgrade_enabled: yes
+      discord:
+        enabled: yes
+        webhook: "" # uses default if blank
+    nodes:
+      - url: tcp://localhost:26657
+        alert_if_down: yes
       - url: https://some-other-node:443
         alert_if_down: no

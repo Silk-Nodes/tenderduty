@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/PagerDuty/go-pagerduty"
+	dash "github.com/Silk-Nodes/tenderduty/v2/td2/dashboard"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
@@ -58,19 +60,6 @@ type alarmCache struct {
 	notifyMux      sync.RWMutex
 }
 
-func (a *alarmCache) clearNoBlocks(chain string) {
-	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
-		return
-	}
-	a.notifyMux.Lock()
-	defer a.notifyMux.Unlock()
-	for clearAlarm := range a.AllAlarms[chain] {
-		if strings.HasPrefix(clearAlarm, "stalled: have not seen a new block on") {
-			delete(a.AllAlarms[chain], clearAlarm)
-		}
-	}
-}
-
 func (a *alarmCache) getCount(chain string) int {
 	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
 		return 0
@@ -78,15 +67,6 @@ func (a *alarmCache) getCount(chain string) int {
 	a.notifyMux.RLock()
 	defer a.notifyMux.RUnlock()
 	return len(a.AllAlarms[chain])
-}
-
-func (a *alarmCache) clearAll(chain string) {
-	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
-		return
-	}
-	a.notifyMux.Lock()
-	defer a.notifyMux.Unlock()
-	a.AllAlarms[chain] = make(map[string]time.Time)
 }
 
 // alarms is used to prevent double notifications. TODO: save on exit / load on start
@@ -158,6 +138,9 @@ func shouldNotify(msg *alertMsg, dest notifyDest) bool {
 
 func notifySlack(msg *alertMsg) (err error) {
 	if !msg.slk {
+		return
+	}
+	if !shouldNotify(msg, slk) {
 		return
 	}
 	data, err := json.Marshal(buildSlackMessage(msg))
@@ -337,32 +320,34 @@ func notifyPagerduty(msg *alertMsg) (err error) {
 	return
 }
 
-func getAlarms(chain string) string {
+// listAlarms returns the active alarms for a chain, oldest first.
+func listAlarms(chain string) []dash.AlertStatus {
 	alarms.notifyMux.RLock()
 	defer alarms.notifyMux.RUnlock()
-	// don't show this info if the logs are disabled on the dashboard, potentially sensitive info could be leaked.
-	if td.HideLogs || alarms.AllAlarms[chain] == nil {
-		return ""
+	out := make([]dash.AlertStatus, 0, len(alarms.AllAlarms[chain]))
+	for msg, since := range alarms.AllAlarms[chain] {
+		out = append(out, dash.AlertStatus{Message: msg, Since: since.Unix()})
 	}
-	result := ""
-	for k := range alarms.AllAlarms[chain] {
-		result += "🚨 " + k + "\n"
-	}
-	return result
+	sort.Slice(out, func(i, j int) bool { return out[i].Since < out[j].Since })
+	return out
 }
 
 // alert creates a universal alert and pushes it to the alertChan to be delivered to appropriate services
 func (c *Config) alert(chainName, message, severity string, resolved bool, id *string) {
+	c.chainsMux.RLock()
 	uniq := c.Chains[chainName].ValAddress
 	if id != nil {
 		uniq = *id
 	}
-	c.chainsMux.RLock()
+	if uniq == "" {
+		uniq = c.Chains[chainName].ChainId
+	}
+	al := c.Chains[chainName].Alerts
 	a := &alertMsg{
-		pd:           c.Pagerduty.Enabled && c.Chains[chainName].Alerts.Pagerduty.Enabled,
-		disc:         c.Discord.Enabled && c.Chains[chainName].Alerts.Discord.Enabled,
-		tg:           c.Telegram.Enabled && c.Chains[chainName].Alerts.Telegram.Enabled,
-		slk:          c.Slack.Enabled && c.Chains[chainName].Alerts.Slack.Enabled,
+		pd:           c.Pagerduty.Enabled && al.Pagerduty.Enabled && wants(al.Pagerduty.SeverityThreshold, severity, resolved),
+		disc:         c.Discord.Enabled && al.Discord.Enabled && wants(al.Discord.SeverityThreshold, severity, resolved),
+		tg:           c.Telegram.Enabled && al.Telegram.Enabled && wants(al.Telegram.SeverityThreshold, severity, resolved),
+		slk:          c.Slack.Enabled && al.Slack.Enabled && wants(al.Slack.SeverityThreshold, severity, resolved),
 		severity:     severity,
 		resolved:     resolved,
 		chain:        chainName,
@@ -375,6 +360,7 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 		discHook:     c.Chains[chainName].Alerts.Discord.Webhook,
 		discMentions: strings.Join(c.Chains[chainName].Alerts.Discord.Mentions, " "),
 		slkHook:      c.Chains[chainName].Alerts.Slack.Webhook,
+		slkMentions:  strings.Join(c.Chains[chainName].Alerts.Slack.Mentions, " "),
 	}
 	c.alertChan <- a
 	c.chainsMux.RUnlock()
@@ -392,9 +378,44 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 	alarms.AllAlarms[chainName][message] = time.Now()
 }
 
+// severityRank orders pagerduty severities so a channel threshold can be compared against an alert. Anything
+// unrecognised ranks as critical so a typo never silences an alert.
+func severityRank(s string) int {
+	switch strings.ToLower(s) {
+	case "info":
+		return 0
+	case "warning":
+		return 1
+	case "error":
+		return 2
+	}
+	return 3
+}
+
+// wants reports whether a channel takes an alert of this severity. Resolves always go through, the dedup logic
+// drops them when nothing was sent.
+func wants(threshold, severity string, resolved bool) bool {
+	return resolved || severityRank(severity) >= severityRank(threshold)
+}
+
+// alertEvent sends a one-off notice for something that already happened and has no resolved state, such as a
+// change in voting power. It is not kept in the active alarm list.
+func (c *Config) alertEvent(chainName, message, severity string, id *string) {
+	c.alert(chainName, message, severity, false, id)
+	alarms.forget(chainName, message)
+}
+
+// forget drops alarms from the dashboard without sending a resolve.
+func (a *alarmCache) forget(chain string, messages ...string) {
+	a.notifyMux.Lock()
+	defer a.notifyMux.Unlock()
+	for _, m := range messages {
+		delete(a.AllAlarms[chain], m)
+	}
+}
+
 // watch handles monitoring for missed blocks, stalled chain, node downtime
 // and also updates a few prometheus stats
-// FIXME: not watching for nodes that are lagging the head block!
 func (cc *ChainConfig) watch() {
 	var missedAlarm, pctAlarm, noNodes bool
 	inactive := "jailed"
@@ -412,7 +433,7 @@ func (cc *ChainConfig) watch() {
 					fmt.Sprintf("no RPC endpoints are working for %s", cc.ChainId),
 					"critical",
 					false,
-					&cc.valInfo.Valcons,
+					cc.alertId(""),
 				)
 			}
 			noNodesSec += 1
@@ -448,7 +469,7 @@ func (cc *ChainConfig) watch() {
 					fmt.Sprintf("no RPC endpoints are working for %s", cc.ChainId),
 					"critical",
 					false,
-					&cc.valInfo.Valcons,
+					cc.alertId(""),
 				)
 			}
 		case cc.Alerts.AlertIfNoServers && noNodes && !cc.noNodes:
@@ -458,42 +479,34 @@ func (cc *ChainConfig) watch() {
 				fmt.Sprintf("no RPC endpoints are working for %s", cc.ChainId),
 				"critical",
 				true,
-				&cc.valInfo.Valcons,
+				cc.alertId(""),
 			)
 		default:
 			noNodesSec = 0
 		}
 
 		// stalled chain detection
-		if cc.Alerts.StalledAlerts && !cc.lastBlockAlarm && !cc.lastBlockTime.IsZero() &&
-			cc.lastBlockTime.Before(time.Now().Add(time.Duration(-cc.Alerts.Stalled)*time.Minute)) {
-
-			// chain is stalled send an alert!
-			cc.lastBlockAlarm = true
-			td.alert(
-				cc.name,
-				fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
-				"critical",
-				false,
-				&cc.valInfo.Valcons,
-			)
-		} else if cc.Alerts.StalledAlerts && cc.lastBlockAlarm && cc.lastBlockTime.IsZero() {
-			cc.lastBlockAlarm = false
-			td.alert(
-				cc.name,
-				fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled),
-				"info",
-				true,
-				&cc.valInfo.Valcons,
-			)
-			alarms.clearNoBlocks(cc.name)
+		stalled := !cc.lastBlockTime.IsZero() &&
+			cc.lastBlockTime.Before(time.Now().Add(time.Duration(-cc.Alerts.Stalled)*time.Minute))
+		if cc.Alerts.StalledAlerts && stalled != cc.lastBlockAlarm {
+			cc.lastBlockAlarm = stalled
+			severity := "critical"
+			if stalled {
+				cc.stalledMsg = fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled)
+				if cc.upgrade != nil && cc.upgrade.Height-cc.lastBlockNum <= 1 && cc.upgrade.Height >= cc.lastBlockNum {
+					cc.stalledMsg += fmt.Sprintf(", the chain halted at upgrade height %d (%s) and needs the new binary", cc.upgrade.Height, cc.upgrade.Name)
+				}
+			} else {
+				severity = "info"
+			}
+			td.alert(cc.name, cc.stalledMsg, severity, !stalled, cc.alertId(""))
 		}
 
 		// jailed detection - only alert if it changes.
 		if cc.Alerts.AlertIfInactive && cc.lastValInfo != nil && cc.lastValInfo.Bonded != cc.valInfo.Bonded &&
 			cc.lastValInfo.Moniker == cc.valInfo.Moniker {
 
-			id := cc.valInfo.Valcons + "jailed"
+			id := *cc.alertId("jailed")
 			// just went inactive, figure out if it's jail or tombstone
 			if !cc.valInfo.Bonded && cc.lastValInfo.Bonded {
 				if cc.valInfo.Tombstoned {
@@ -522,7 +535,7 @@ func (cc *ChainConfig) watch() {
 		if !missedAlarm && cc.Alerts.ConsecutiveAlerts && int(cc.statConsecutiveMiss) >= cc.Alerts.ConsecutiveMissed {
 			// alert on missed block counter!
 			missedAlarm = true
-			id := cc.valInfo.Valcons + "consecutive"
+			id := *cc.alertId("consecutive")
 			td.alert(
 				cc.name,
 				fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
@@ -530,11 +543,10 @@ func (cc *ChainConfig) watch() {
 				false,
 				&id,
 			)
-			cc.activeAlerts = alarms.getCount(cc.name)
 		} else if missedAlarm && int(cc.statConsecutiveMiss) < cc.Alerts.ConsecutiveMissed {
 			// clear the alert
 			missedAlarm = false
-			id := cc.valInfo.Valcons + "consecutive"
+			id := *cc.alertId("consecutive")
 			td.alert(
 				cc.name,
 				fmt.Sprintf("%s has missed %d blocks on %s", cc.valInfo.Moniker, cc.Alerts.ConsecutiveMissed, cc.ChainId),
@@ -542,14 +554,13 @@ func (cc *ChainConfig) watch() {
 				true,
 				&id,
 			)
-			cc.activeAlerts = alarms.getCount(cc.name)
 		}
 
 		// window percentage missed block alarms
 		if cc.Alerts.PercentageAlerts && !pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) > float64(cc.Alerts.Window) {
 			// alert on missed block counter!
 			pctAlarm = true
-			id := cc.valInfo.Valcons + "percent"
+			id := *cc.alertId("percent")
 			td.alert(
 				cc.name,
 				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
@@ -557,19 +568,17 @@ func (cc *ChainConfig) watch() {
 				false,
 				&id,
 			)
-			cc.activeAlerts = alarms.getCount(cc.name)
 		} else if cc.Alerts.PercentageAlerts && pctAlarm && 100*float64(cc.valInfo.Missed)/float64(cc.valInfo.Window) < float64(cc.Alerts.Window) {
 			// clear the alert
 			pctAlarm = false
-			id := cc.valInfo.Valcons + "percent"
+			id := *cc.alertId("percent")
 			td.alert(
 				cc.name,
 				fmt.Sprintf("%s has missed > %d%% of the slashing window's blocks on %s", cc.valInfo.Moniker, cc.Alerts.Window, cc.ChainId),
 				"info",
-				false,
+				true,
 				&id,
 			)
-			cc.activeAlerts = alarms.getCount(cc.name)
 		}
 
 		// node down alarms
@@ -579,14 +588,13 @@ func (cc *ChainConfig) watch() {
 				time.Since(node.downSince) > time.Duration(td.NodeDownMin)*time.Minute {
 				// alert on dead node
 				if !nodeAlarms[node.Url] {
-					cc.activeAlerts = alarms.getCount(cc.name)
 				} else {
 					continue
 				}
 				nodeAlarms[node.Url] = true // used to keep active alert count correct
 				td.alert(
 					cc.name,
-					fmt.Sprintf("Severity: %s\nRPC node %s has been down for > %d minutes on %s", td.NodeDownSeverity, node.Url, td.NodeDownMin, cc.ChainId),
+					fmt.Sprintf("RPC node %s has been down for > %d minutes on %s", node.Url, td.NodeDownMin, cc.ChainId),
 					td.NodeDownSeverity,
 					false,
 					&node.Url,
@@ -597,12 +605,11 @@ func (cc *ChainConfig) watch() {
 				node.wasDown = false
 				td.alert(
 					cc.name,
-					fmt.Sprintf("Severity: %s\nRPC node %s has been down for > %d minutes on %s", td.NodeDownSeverity, node.Url, td.NodeDownMin, cc.ChainId),
+					fmt.Sprintf("RPC node %s has been down for > %d minutes on %s", node.Url, td.NodeDownMin, cc.ChainId),
 					"info",
 					true,
 					&node.Url,
 				)
-				cc.activeAlerts = alarms.getCount(cc.name)
 			}
 		}
 

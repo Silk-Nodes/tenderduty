@@ -1,62 +1,170 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="en" data-theme="dark">
 <head>
-  <style>
-      /*canvas {
-          image-rendering: -moz-crisp-edges;
-          image-rendering: -webkit-crisp-edges;
-          image-rendering: crisp-edges;
-      }*/
-  </style>
   <meta charset="utf-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="stylesheet" href="css/uikit.min.css" />
-  <title>Tenderduty Dashboard</title>
+  <title>Tenderduty</title>
+  <link rel="stylesheet" href="css/uikit.min.css"/>
+  <link rel="icon" type="image/png" href="favicon.png">
+  <link rel="apple-touch-icon" href="apple-touch-icon.png">
+  <style>
+    :root {
+      --bg: #f4f5f7; --panel: #ffffff; --panel-2: #eef0f3; --text: #1c1f24; --muted: #646b74; --line: #dde0e5;
+      --log-bg: #ffffff; --log-text: #2a2f36; --ok: #1f9d5b; --warn: #d9850c; --bad: #d6453d; --accent: #2f6fdb;
+    }
+    html[data-theme="dark"] {
+      --bg: #121417; --panel: #1a1d22; --panel-2: #22262c; --text: #e4e6ea; --muted: #8f969f; --line: #2c3138;
+      --log-bg: #0f1114; --log-text: #b8bec6; --ok: #3ccf8e; --warn: #f0a53a; --bad: #ef6b63; --accent: #5aa2f5;
+    }
+    html { background: var(--bg); min-height: 100%; }
+    body {
+      background: var(--bg); color: var(--text); min-height: 100vh;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      font-variant-numeric: tabular-nums;
+    }
+    .wrap { max-width: 1680px; margin: 0 auto; padding: 14px 20px 28px; }
+    .top { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; }
+    .top .title { font-weight: 600; font-size: 15px; letter-spacing: 0.01em; color: var(--text); text-decoration: none; }
+    .top .spacer { flex: 1; }
+    .chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 10px; border-radius: 999px;
+      background: var(--panel); border: 1px solid var(--line); font-size: 12px; color: var(--muted); white-space: nowrap; }
+    .chip b { color: var(--text); font-weight: 600; }
+    .chip.alerts b { color: var(--warn); }
+    .chip.alerts.none b { color: var(--text); }
+    .chip.nodes.short b { color: var(--warn); }
+    .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
+    .dot.on { background: var(--ok); box-shadow: 0 0 0 3px color-mix(in srgb, var(--ok) 25%, transparent); }
+    .toggle { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; border-radius: 50%;
+      border: 1px solid var(--line); background: var(--panel); color: var(--muted); cursor: pointer; }
+    .toggle:hover { color: var(--text); }
+    .toggle svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    html[data-theme="dark"] .toggle .moon, html[data-theme="light"] .toggle .sun { display: none; }
+    a.icon, a.icon:hover { color: var(--muted); text-decoration: none; display: inline-flex; }
+    a.icon:hover { color: var(--text); }
+
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 14px; }
+    #gridWrap { position: relative; width: 100%; }
+    #canvas { display: block; width: 100%; }
+    #gridTip { position: absolute; pointer-events: none; display: none; padding: 3px 8px; border-radius: 6px;
+      background: var(--panel-2); color: var(--text); border: 1px solid var(--line); font-size: 12px; white-space: nowrap; }
+    #legend { display: block; margin: 6px auto 0; }
+
+    .uk-table { margin: 0; }
+    .uk-table th { color: var(--muted); font-size: 11px; letter-spacing: 0; text-transform: none; font-weight: 600;
+      border-bottom: 1px solid var(--line); padding: 6px 10px; }
+    .uk-table td { vertical-align: middle; border-top: 1px solid var(--line); padding: 9px 10px; font-size: 13px; }
+    .uk-table tbody tr:first-child td { border-top: 0; }
+    tr.chain { cursor: pointer; }
+    tr.chain:hover td { background: var(--panel-2); }
+    tr.chain.open td { background: var(--panel-2); }
+    tr.detail td { background: var(--panel-2); border-top: 0; padding-top: 0; padding-bottom: 14px; }
+    tr.divider td { padding: 14px 10px 4px; font-size: 11px; font-weight: 600; color: var(--muted); border-top: 0; }
+    .name { font-weight: 600; }
+    .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 12.5px; }
+    .muted { color: var(--muted); }
+    .ok { color: var(--ok); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .st { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--ok); }
+    .st.warn { background: var(--warn); }
+    .st.bad { background: var(--bad); }
+    .st.off { background: var(--line); }
+    .badge { display: inline-block; min-width: 1.8em; padding: 1px 7px; border-radius: 999px; text-align: center; font-weight: 600; font-size: 12px; }
+    .badge.warn { background: var(--warn); color: #1c1f24; }
+    .badge.ok { background: var(--panel-2); color: var(--muted); }
+    th.jail, td.jail { min-width: 200px; }
+    th.jail .row { display: flex; justify-content: space-between; }
+    .uptime { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; white-space: nowrap; }
+    .uptime .pct { font-weight: 600; }
+    .bar { height: 4px; border-radius: 2px; background: var(--line); margin-top: 5px; overflow: hidden; }
+    .bar i { display: block; height: 100%; border-radius: 2px; min-width: 2px; }
+
+    .detail h4 { font-size: 11px; font-weight: 600; color: var(--muted); margin: 10px 0 4px; }
+    .detail table { margin: 0; }
+    .detail .uk-table th, .detail .uk-table td { padding: 4px 8px; font-size: 12.5px; border-top: 1px solid var(--line); }
+    .detail .note { max-width: 24em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .detail a, .detail a:hover { color: var(--accent); text-decoration: none; }
+    .detail a:hover { text-decoration: underline; }
+
+    .help { font-size: 12px; color: var(--muted); max-width: 70ch; margin: -4px 0 14px 2px; line-height: 1.5; }
+    .help b { color: var(--text); font-weight: 600; }
+
+    #logs { background: var(--log-bg); color: var(--log-text); border: 1px solid var(--line); border-radius: 10px;
+      height: 280px; font-size: 12px; padding: 10px 12px; margin: 0 0 14px; }
+    footer { font-size: 12px; color: var(--muted); text-align: center; line-height: 1.7; }
+    footer a, footer a:hover { color: var(--muted); text-decoration: none; }
+    footer a.credit { color: var(--accent); }
+    footer .links { display: inline-flex; gap: 10px; align-items: center; }
+  </style>
   <script src="js/uikit.min.js"></script>
-  <script src="./js/uikit-icons.min.js"></script>
-  <script src="./js/lodash.min.js"></script>
-  <script type="application/javascript" src="grid.js"></script>
-  <script type="application/javascript" src="status.js"></script>
-  <link rel="icon" href="favicon.png">
+  <script src="js/uikit-icons.min.js"></script>
+  <script src="grid.js"></script>
+  <script src="status.js"></script>
 </head>
 
-<body class="uk-background-secondary uk-light" onload="loadState(); legend()">
-<div class="uk-container uk-width-expand uk-height-viewport">
-  <div class="uk-width-expand uk-overflow-auto uk-background-secondary" id="canvasDiv">
-    <div style="width: 4835px;" class="uk-padding-remove-horizontal">
-      <canvas id="canvas" height="20" width="4735"></canvas>
+<body>
+<div class="wrap">
+  <header class="top">
+    <span class="title">Tenderduty</span>
+    <span class="spacer"></span>
+    <span class="chip" id="sumChains"><b>0</b> chains</span>
+    <span class="chip nodes" id="sumNodes"><b>0 / 0</b> nodes up</span>
+    <span class="chip alerts none" id="sumAlerts"><b>0</b> alerts</span>
+    <span class="chip"><span class="dot" id="connDot"></span> <span id="connText">connecting</span></span>
+    <button id="themeToggle" class="toggle" type="button" uk-tooltip="Switch between light and dark mode" aria-label="Switch between light and dark mode">
+      <svg class="sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+      <svg class="moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+    </button>
+  </header>
+
+  <div class="card">
+    <div id="gridWrap">
+      <canvas id="canvas" height="20"></canvas>
+      <div id="gridTip"></div>
     </div>
-    <div id="legendContainer" class="uk-nav-center uk-background-secondary uk-padding-remove">
-      <canvas id="legend" height="32" width="700"></canvas>
-    </div>
+    <canvas id="legend" height="32" width="700"></canvas>
   </div>
 
-  <div class="uk-padding-small uk-text-small uk-background-secondary uk-overflow-auto" id="tableDiv">
-    <table class="uk-table uk-table-small uk-table-justify uk-padding-remove">
+  <div class="card uk-overflow-auto">
+    <table class="uk-table uk-table-small uk-table-middle">
       <thead>
       <tr>
         <th></th>
         <th>Chain</th>
+        <th>Chain ID</th>
         <th>Height</th>
+        <th>Last block</th>
         <th>Moniker</th>
-        <th style="text-align: center">Bonded</th>
-        <th class="uk-text-center">Uptime</th>
-        <th class="uk-text-center">RPC Nodes</th>
+        <th>Status</th>
+        <th class="jail"><span class="row"><span>Missed / jail at</span><span>Uptime</span></span></th>
+        <th class="uk-text-right">Voting power</th>
+        <th>Upgrade</th>
+        <th class="uk-text-center">Gov</th>
+        <th class="uk-text-center">RPC nodes</th>
       </tr>
       </thead>
       <tbody id="statusTable"></tbody>
     </table>
   </div>
 
-  <div class="uk-padding-large uk-padding-remove-top" id="logContainer">
-    <pre id="logs" class="uk-panel-scrollable uk-resize-vertical" style="background: #080808; height: 300px;"></pre>
+  <p class="help">
+    <b>Missed / jail at</b> counts the blocks missed in the chain's signing window against the number that gets the
+    validator jailed. Each chain sets the window and the minimum share of it that must be signed, so the jail count
+    differs per chain. The bar fills as the allowance is used and shifts from green to red on the way.
+    <b>Uptime</b> is the share of the window that was signed.
+  </p>
+
+  <div id="logContainer">
+    <pre id="logs" class="uk-panel-scrollable uk-resize-vertical"></pre>
   </div>
 
-  <div class="uk-text-small uk-text-center">
-    <a class="uk-link-muted" onclick="lightMode()"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" fill="currentColor" class="bi bi-brightness-high" viewBox="0 0 16 16"><path d="M8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm0 1a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM8 0a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 0zm0 13a.5.5 0 0 1 .5.5v2a.5.5 0 0 1-1 0v-2A.5.5 0 0 1 8 13zm8-5a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2a.5.5 0 0 1 .5.5zM3 8a.5.5 0 0 1-.5.5h-2a.5.5 0 0 1 0-1h2A.5.5 0 0 1 3 8zm10.657-5.657a.5.5 0 0 1 0 .707l-1.414 1.415a.5.5 0 1 1-.707-.708l1.414-1.414a.5.5 0 0 1 .707 0zm-9.193 9.193a.5.5 0 0 1 0 .707L3.05 13.657a.5.5 0 0 1-.707-.707l1.414-1.414a.5.5 0 0 1 .707 0zm9.193 2.121a.5.5 0 0 1-.707 0l-1.414-1.414a.5.5 0 0 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .707zM4.464 4.465a.5.5 0 0 1-.707 0L2.343 3.05a.5.5 0 1 1 .707-.707l1.414 1.414a.5.5 0 0 1 0 .708z"/></svg></a>
-    <a class="uk-link-muted" href="https://blockpane.com"><img src="bp-logo-text.svg" alt="[ block pane ]" style="height: 24px;"></a>
-    <a href="https://github.com/blockpane/tenderduty"><span uk-icon="github" style="color: grey"></span></a>
-  </div>
+  <footer>
+    <span class="links">
+      <a href="https://silknodes.io">Silk Nodes</a>
+      <a class="icon" href="https://github.com/Silk-Nodes/tenderduty" aria-label="Source on GitHub"><span uk-icon="github"></span></a>
+    </span>
+    <div>Built on the original <a class="credit" href="https://github.com/blockpane/tenderduty">Tenderduty</a> by Todd G of Blockpane.<br>Thank you, Todd.</div>
+  </footer>
 </div>
 </body>
 </html>

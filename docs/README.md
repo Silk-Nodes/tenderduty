@@ -10,10 +10,9 @@ This is a tool for validators running tendermint nodes. It sends notifications w
 - [Configuration File Settings](config.md)
 - [Setting up PagerDuty](pagerduty.md)
 - [Setting up Discord](discord.md)
-- TODO: [Setting up Telegram](telegram.md)
+- [Setting up Telegram](telegram.md)
 - [Prometheus Exports](prometheus.md)
 - [Remotely Configuring Tenderduty](remote.md)
-- [Running on Akash](akash.md)
 
 ## What does it do?
 
@@ -27,14 +26,18 @@ Monitors a validator's performance across multiple chains
     * Configurable threshold to wait before alerting on downtime
 - If no nodes are alive it can fallback to using public RPC nodes.
 
+- Alerts when a software upgrade is scheduled, with reminders as the height approaches.
+- Reminds when a governance proposal is open and the validator has not voted.
+- Notifies when the delegated stake jumps or drops.
+
 Provides a prometheus exporter for integration with other visualization systems.<br />
-Sends an alert to any of three destinations: Pagerduty, Discord, or Telegram.
+Sends an alert to any of four destinations: Pagerduty, Discord, Telegram, or Slack.
 
 A dashboard for displaying status.
 
 - The missed block grid was heavily influenced by the uptime display on [ping.pub](https://ping.pub). *Many thanks for the inspiration!*
 - The last 512 blocks are displayed on the status grid.
-- Displays a table showing validator and node status.
+- Displays a table showing validator and node status, including missed blocks against the chain's jail threshold (`signed_blocks_window` and `min_signed_per_window` from x/slashing).
 - Designed intentionally for maximum density for validators on a lot of chains.
 - Dark/light display modes.
 - Optionally shows a real-time stream of log messages with details about ongoing health checks.
@@ -61,7 +64,8 @@ For each chain being monitored:
 * Uses a websocket to subscribe to NewBlock and Vote events.
   - The votes are used to determine if a pre-vote/pre-commit was sent by the validator.
   - The finalized blocks are checked for the validator's signature.
-* Once/minute checks the health of all nodes by creating a new RPC client and getting the status.
+* Once/minute checks all nodes at the same time: status, chain-id, sync state and block height. The node with the highest height is used. If the node in use goes down, falls more than `lag_blocks` behind, or its websocket stops delivering blocks, the next best node takes over.
+* Once/minute refreshes the scheduled upgrade plan, the proposals in their voting period, and the delegated stake.
 * If all configured nodes are down it can use the [cosmos.directory](https://cosmos.directory) to locate a public RPC node.
 
 Dashboard:

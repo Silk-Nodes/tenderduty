@@ -12,6 +12,12 @@ The current count of consecutively missed blocks regardless of precommit or prev
 
 `tenderduty_consecutive_missed_blocks{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 0`
 
+### tenderduty_endpoint_syncing_seconds_behind
+
+How many seconds a node's latest block is behind the newest block reported by any of the chain's nodes, refreshed once a minute
+
+`tenderduty_endpoint_syncing_seconds_behind{chain_id="chain-id",endpoint="http://somehost:26657",moniker="Moniker",name="Chain Name"} 0`
+
 ### tenderduty_endpoint_down_seconds
 
 How many seconds a node has been marked as unhealthy
@@ -83,3 +89,28 @@ The count of rpc endpoints being monitored for a chain
 The count of unhealthy rpc endpoints being monitored for a chain
 
 `tenderduty_total_unhealthy_endpoints{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 0`
+
+### tenderduty_upgrade_blocks_remaining
+
+Blocks until the scheduled x/upgrade height, -1 when no upgrade is scheduled
+
+`tenderduty_upgrade_blocks_remaining{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 14400`
+
+### tenderduty_unvoted_proposals
+
+Count of proposals in their voting period that the validator has not voted on
+
+`tenderduty_unvoted_proposals{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 1`
+
+### tenderduty_voting_power_tokens
+
+Stake delegated to the validator in the chain's base denomination
+
+`tenderduty_voting_power_tokens{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 16663525660829`
+
+### tenderduty_voting_power_percent
+
+The validator's share of all bonded tokens on the chain
+
+`tenderduty_voting_power_percent{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 2.14`
+

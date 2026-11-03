@@ -1,6 +1,6 @@
 module github.com/Silk-Nodes/tenderduty/v2
 
-go 1.26.0
+go 1.26.10
 
 require (
 	cosmossdk.io/math v1.5.3

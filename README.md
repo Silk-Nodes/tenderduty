@@ -29,9 +29,9 @@ Tenderduty was written by [blockpane](https://github.com/blockpane), and v2 was 
 
 ✅ **Alerts that never resolved now do.** Upstream, the percentage-missed alert sent its clear as a new alarm, the stalled alert waited for a condition that never came, the "no RPC endpoints" alarm cleared whenever any node answered, and a node that was down at restart never alerted or cleared. Each left a PagerDuty incident open until someone closed it by hand. All four now resolve on their own.
 
-🛠️ **Up to date.** cosmos-sdk 0.53, CometBFT 0.38 and Go 1.26. The module path is `github.com/Silk-Nodes/tenderduty/v2` with no replace directives, so `go install github.com/Silk-Nodes/tenderduty/v2@latest` works, and there is a Makefile and a systemd guide.
+🛠️ **Up to date.** cosmos-sdk 0.53, CometBFT 0.38 and Go 1.26. The module path is `github.com/Silk-Nodes/tenderduty/v2` with no replace directives, so `go install github.com/Silk-Nodes/tenderduty/v2@latest` works, and there is a Makefile and a systemd guide. Dependabot keeps patch releases coming, and `make vulncheck` runs govulncheck in CI on every push and weekly, failing on any advisory the code reaches that [docs/security-exceptions.md](docs/security-exceptions.md) does not accept.
 
-🩹 **Other fixes.** Slack alerts are de-duplicated like the other channels, a crash when an RPC URL could not be parsed, a healthcheck ping with no timeout, a dashboard that only updated when a block arrived, and a node-down alert whose text began with an empty severity.
+🩹 **Other fixes.** The dashboard feed dropped about half of its updates, so the block grid moved in jumps; it now gets every one-second update and a stale browser tab no longer holds the others up. Slack alerts are de-duplicated like the other channels, a crash when an RPC URL could not be parsed, a healthcheck ping with no timeout, a dashboard that only updated when a block arrived, and a node-down alert whose text began with an empty severity.
 
 The new alert types are opt-in per chain: `upgrade_enabled`, `governance_enabled` and `voting_power_enabled` under `alerts`. See [docs/config.md](docs/config.md).
 

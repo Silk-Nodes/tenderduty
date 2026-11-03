@@ -658,7 +658,7 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 	// buffer enough to get through validateConfig()
 	c.updateChan = make(chan *dash.ChainStatus, len(c.Chains)*2)
 	c.statsChan = make(chan *promUpdate, len(c.Chains)*2)
-	c.ctx, c.cancel = context.WithCancel(context.Background())
+	c.ctx, c.cancel = context.WithCancel(context.Background()) // #nosec G118 -- cancel is kept on the config and called when Run returns
 
 	// handle cached data. FIXME: incomplete.
 	c.alarms = &alarmCache{

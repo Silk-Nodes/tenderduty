@@ -61,6 +61,6 @@ func main() {
 
 	err := td2.Run(configFile, stateFile, chainConfigDirectory, &password)
 	if err != nil {
-		log.Println(err.Error(), "... exiting.")
+		log.Println(err.Error(), "... exiting.") // #nosec G706 -- the error text comes from local files and flags, not from a request
 	}
 }

@@ -94,7 +94,8 @@ WantedBy=multi-user.target
 EOF
 ```
 
-To upgrade: `git pull && make install && sudo systemctl restart tenderduty`.
+To upgrade: `git pull && make install && sudo systemctl restart tenderduty`. `tenderduty version` prints the tag, the
+commit and the Go toolchain the binary was built with.
 
 `make build` writes the binary to the repo directory instead, and `make docker` builds the container image locally.
 

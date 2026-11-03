@@ -75,7 +75,8 @@ chains:
     chain_id: osmosis-1
     # Hooray, in v2 we derive the valcons from abci queries so you don't have to jump through hoops to figure out how
     # to convert ed25519 keys to the appropriate bech32 address.
-    # Use valcons address if using ICS.
+    # A valcons address works too: the operator is looked up in the validator set. On an ICS consumer chain, where
+    # that lookup cannot work, only the signing checks run.
     # Leave it out entirely for a chain where you run RPC nodes but no validator: node health, stalled chain and
     # upgrade alerts still apply, signing and governance checks are skipped.
     valoper_address: osmovaloper1xxxxxxx...

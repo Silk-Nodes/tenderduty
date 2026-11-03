@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +28,7 @@ type alertMsg struct {
 	severity string
 	resolved bool
 	chain    string
+	chainId  string
 	message  string
 	uniqueId string
 	key      string
@@ -180,18 +183,13 @@ type Attachment struct {
 }
 
 func buildSlackMessage(msg *alertMsg) *SlackMessage {
-	prefix := "🚨 ALERT: "
-	color := "danger"
-	if msg.resolved {
-		msg.message = "OK: " + msg.message
-		prefix = "💜 Resolved: "
-		color = "good"
-	}
+	_, color := severityColor(msg)
 	return &SlackMessage{
-		Text: msg.message,
+		Text: strings.TrimSpace(msg.slkMentions),
 		Attachments: []Attachment{
 			{
-				Title: fmt.Sprintf("TenderDuty %s %s %s", prefix, msg.chain, msg.slkMentions),
+				Title: alertHeading(msg),
+				Text:  alertBody(msg) + "\n" + msg.chainId,
 				Color: color,
 			},
 		},
@@ -213,26 +211,39 @@ func notifyDiscord(msg *alertMsg) (err error) {
 		return err
 	}
 
-	req, err := http.NewRequest("POST", msg.discHook, bytes.NewBuffer(data))
-	if err != nil {
-		l("⚠️ Could not notify discord!", err)
-		return err
+	// a webhook takes five posts per two seconds; a burst of alerts (several proposals at once) runs into that,
+	// so a 429 waits for the window Discord names and tries again rather than losing the message
+	for attempt := 0; attempt < 4; attempt++ {
+		req, err := http.NewRequest("POST", msg.discHook, bytes.NewBuffer(data))
+		if err != nil {
+			l("⚠️ Could not notify discord!", err)
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			l("⚠️ Could not notify discord!", err)
+			return err
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+		switch {
+		case resp.StatusCode == 204:
+			return nil
+		case resp.StatusCode == 429:
+			wait := 2 * time.Second
+			if s, e := strconv.ParseFloat(resp.Header.Get("X-RateLimit-Reset-After"), 64); e == nil && s > 0 && s < 30 {
+				wait = time.Duration(s*float64(time.Second)) + 250*time.Millisecond
+			}
+			l(fmt.Sprintf("⏳ discord rate limit, retrying in %.1fs", wait.Seconds()))
+			time.Sleep(wait)
+		default:
+			l(fmt.Sprintf("⚠️ Could not notify discord! Returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body))))
+			return fmt.Errorf("discord returned %d", resp.StatusCode)
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := client.Do(req)
-	if err != nil {
-		l("⚠️ Could not notify discord!", err)
-		return err
-	}
-	_ = resp.Body.Close()
-
-	if resp.StatusCode != 204 {
-		log.Println(resp)
-		l("⚠️ Could not notify discord! Returned", resp.StatusCode)
-		return err
-	}
-	return nil
+	l("⚠️ Could not notify discord! Rate limited on every attempt")
+	return errors.New("discord rate limited")
 }
 
 type DiscordMessage struct {
@@ -243,22 +254,96 @@ type DiscordMessage struct {
 }
 
 type DiscordEmbed struct {
-	Title       string `json:"title,omitempty"`
-	Url         string `json:"url,omitempty"`
-	Description string `json:"description"`
-	Color       uint   `json:"color"`
+	Title       string         `json:"title,omitempty"`
+	Url         string         `json:"url,omitempty"`
+	Description string         `json:"description"`
+	Color       uint           `json:"color"`
+	Fields      []DiscordField `json:"fields,omitempty"`
+	Timestamp   string         `json:"timestamp,omitempty"`
+}
+
+type DiscordField struct {
+	Name   string `json:"name"`
+	Value  string `json:"value"`
+	Inline bool   `json:"inline"`
+}
+
+// alertKind names the kind of alert from its text, so the chat channels can head it with an emoji and a title
+// without changing the messages, which are also the de-duplication keys.
+func alertKind(message string) (emoji, kind string) {
+	switch {
+	case strings.HasPrefix(message, "proposal ") || strings.HasPrefix(message, "upgrade proposal "):
+		return "🗳️", "Governance"
+	case strings.HasPrefix(message, "upgrade "):
+		return "⬆️", "Upgrade"
+	case strings.HasPrefix(message, "voting power"):
+		return "📊", "Voting power"
+	case strings.HasPrefix(message, "RPC node "):
+		return "📡", "RPC node down"
+	case strings.HasPrefix(message, "no RPC endpoints"):
+		return "📡", "No RPC endpoints"
+	case strings.HasPrefix(message, "stalled"):
+		return "⏸️", "Chain stalled"
+	case strings.Contains(message, "has missed"):
+		return "❌", "Missed blocks"
+	case strings.Contains(message, "no longer active"):
+		return "⚠️", "Validator inactive"
+	}
+	return "🚨", "Alert"
+}
+
+// alertHeading is the one-line title for a chat message: the kind, the chain, and whether it is a resolve.
+func alertHeading(msg *alertMsg) string {
+	emoji, kind := alertKind(msg.message)
+	if msg.resolved {
+		return "✅ Resolved: " + kind + " on " + msg.chain
+	}
+	return emoji + " " + kind + " on " + msg.chain
+}
+
+// alertBody breaks the one-line message into readable lines and drops the chain id, which the heading carries.
+func alertBody(msg *alertMsg) string {
+	body := strings.Replace(msg.message, " on "+msg.chainId, "", 1)
+	for _, r := range []struct{ from, to string }{
+		{" is open for voting until ", "\nopen for voting until "},
+		{" closes in under ", "\ncloses in under "},
+		{" and ", "\n"},
+		{" has been down for ", "\ndown for "},
+		{": have not seen", "\nhave not seen"},
+	} {
+		body = strings.Replace(body, r.from, r.to, 1)
+	}
+	return body
+}
+
+// severityColor is the embed colour for Discord and Slack.
+func severityColor(msg *alertMsg) (discord uint, slack string) {
+	switch {
+	case msg.resolved:
+		return 0x3CCF8E, "good"
+	case msg.severity == "critical" || msg.severity == "error":
+		return 0xE5534B, "danger"
+	case msg.severity == "warning":
+		return 0xF0A53A, "warning"
+	}
+	return 0x3B8BE0, "#3B8BE0"
 }
 
 func buildDiscordMessage(msg *alertMsg) *DiscordMessage {
-	prefix := "🚨 ALERT: "
-	if msg.resolved {
-		prefix = "💜 Resolved: "
+	color, _ := severityColor(msg)
+	fields := []DiscordField{{Name: "Chain", Value: msg.chainId, Inline: true}}
+	if !msg.resolved {
+		fields = append(fields, DiscordField{Name: "Severity", Value: msg.severity, Inline: true})
 	}
 	return &DiscordMessage{
 		Username: "Tenderduty",
-		Content:  prefix + msg.chain,
+		Content:  msg.discMentions,
 		Embeds: []DiscordEmbed{{
-			Description: msg.message,
+			Title:       alertHeading(msg),
+			Description: alertBody(msg),
+			Color:       color,
+			Fields:      fields,
+			Timestamp:   time.Now().UTC().Format(time.RFC3339),
 		}},
 	}
 }
@@ -276,12 +361,11 @@ func notifyTg(msg *alertMsg) (err error) {
 		return
 	}
 
-	prefix := "🚨 ALERT: "
-	if msg.resolved {
-		prefix = "💜 Resolved: "
+	text := alertHeading(msg) + "\n" + alertBody(msg) + "\n" + msg.chainId
+	if msg.tgMentions != "" {
+		text += "\n" + msg.tgMentions
 	}
-
-	mc := tgbotapi.NewMessageToChannel(msg.tgChannel, fmt.Sprintf("%s: %s - %s", msg.chain, prefix, msg.message))
+	mc := tgbotapi.NewMessageToChannel(msg.tgChannel, text)
 	_, err = bot.Send(mc)
 	if err != nil {
 		l("telegram send:", err)
@@ -351,6 +435,7 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 		severity:     severity,
 		resolved:     resolved,
 		chain:        chainName,
+		chainId:      c.Chains[chainName].ChainId,
 		message:      message,
 		uniqueId:     uniq,
 		key:          c.Chains[chainName].Alerts.Pagerduty.ApiKey,

@@ -75,4 +75,5 @@ jobs:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ env.IMAGE }}:dev,${{ env.IMAGE }}:dev-${{ steps.date.outputs.date }}
+          build-args: VERSION=dev-${{ steps.date.outputs.date }}-${{ github.sha }}
           labels: ${{ steps.meta.outputs.labels }}

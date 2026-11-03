@@ -9,6 +9,10 @@ updates:
     groups:
       go-modules:
         patterns: ["*"]
+      # security fixes arrive whenever an advisory is published; one PR for all of them, not one each
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
     ignore:
       - dependency-name: github.com/cosmos/cosmos-sdk
         update-types: ["version-update:semver-major", "version-update:semver-minor"]

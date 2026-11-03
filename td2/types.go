@@ -94,6 +94,7 @@ type ChainConfig struct {
 	currentUrl     string        // the node the client is pointed at
 	noNodes        bool          // tracks if all nodes are down
 	valInfo        *ValInfo      // recent validator state, only refreshed every few minutes
+	operator       string        // valoper used for staking and governance queries, found from a valcons when needed
 	lastValInfo    *ValInfo      // use for detecting newly-jailed/tombstone
 	blocksResults  []int
 	lastError      string

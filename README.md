@@ -17,11 +17,15 @@ Tenderduty was written by [blockpane](https://github.com/blockpane), and v2 was 
 
 ⬆️ **Upgrade alerts.** Read from the x/upgrade module: a notice when a plan is scheduled, one when it is under 24 hours away and one when it is under 60 minutes away, with the time estimated from recent block times. If the chain halts at its upgrade height, the stalled alert says so. One resolve once the upgrade is through.
 
+🔑 **Consensus addresses get the full set of checks.** A chain configured with a valcons address used to get signing checks only. The operator is now looked up in the bonded set, so moniker, jail state, stake, governance and voting power work for it too; consumer chains without a staking module keep the old behaviour.
+
 📡 **RPC-only chains.** Leave out `valoper_address` for a chain where you only run RPC nodes and you still get node health, stalled chain and upgrade alerts for it. They are listed below the validators on the dashboard.
 
 🗳️ **Governance reminders.** A reminder when a proposal is in its voting period and the validator has not voted, and a second one under 24 hours before the end. Resolved once the vote is cast.
 
 📊 **Voting power changes.** A notice when the delegated stake moves by more than a set percentage between two refreshes.
+
+💬 **Readable chat messages.** Discord, Slack and Telegram alerts carry a heading with an emoji for the kind of alert (governance, upgrade, missed blocks, node down, stalled chain, voting power, validator inactive), the chain, a colour for the severity, and the detail broken into lines instead of one long sentence. Resolves are green. Discord posts that hit the webhook rate limit are retried instead of lost.
 
 🔕 **Per-channel severity threshold.** PagerDuty defaults to `warning`, so the new notices (info) go to Discord, Telegram and Slack but do not page anyone unless you raise their priority.
 
@@ -73,6 +77,8 @@ The [documentation](docs/README.md) is a work-in-progress.
 ```
 $ tenderduty -h
 Usage of tenderduty:
+  version
+    	print the version, commit and Go toolchain the binary was built with
   -example-config
     	print the an example config.yml and exit
   -f string

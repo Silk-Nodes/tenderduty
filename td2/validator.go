@@ -1,6 +1,7 @@
 package tenderduty
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,9 +11,11 @@ import (
 
 	"cosmossdk.io/math"
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	codectypes "github.com/cosmos/cosmos-sdk/codec/types"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/ed25519"
 	"github.com/cosmos/cosmos-sdk/crypto/keys/secp256k1"
 	"github.com/cosmos/cosmos-sdk/types/bech32"
+	"github.com/cosmos/cosmos-sdk/types/query"
 	slashing "github.com/cosmos/cosmos-sdk/x/slashing/types"
 	staking "github.com/cosmos/cosmos-sdk/x/staking/types"
 )
@@ -93,10 +96,24 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 		cc.valInfo = &ValInfo{}
 	}
 
-	// Fetch info from /cosmos.staking.v1beta1.Query/Validator
-	// it's easier to ask people to provide valoper since it's readily available on
-	// explorers, so make it easy and lookup the consensus key for them.
-	cc.valInfo.Conspub, cc.valInfo.Moniker, cc.valInfo.Jailed, cc.valInfo.Bonded, cc.valInfo.Tokens, err = getVal(ctx, cc.client, cc.ValAddress)
+	// Staking and governance are keyed by the operator address. A config may give the consensus address instead,
+	// which some chains need; the operator is then looked up once in the bonded set. If that fails (a consumer
+	// chain with no staking module) only the signing checks run, as before.
+	if cc.operator == "" {
+		if !strings.Contains(cc.ValAddress, "valcons") {
+			cc.operator = cc.ValAddress
+		} else if op, e := findOperator(ctx, cc.client, cc.ValAddress); e == nil {
+			cc.operator = op
+			l(fmt.Sprintf("⚙️ %s belongs to %s, using it for staking and governance", cc.ValAddress, op))
+		} else if first {
+			l(fmt.Sprintf("❓ could not find the operator for %s (%v), signing checks only", cc.ValAddress, e))
+		}
+	}
+	target := cc.operator
+	if target == "" {
+		target = cc.ValAddress
+	}
+	cc.valInfo.Conspub, cc.valInfo.Moniker, cc.valInfo.Jailed, cc.valInfo.Bonded, cc.valInfo.Tokens, err = getVal(ctx, cc.client, target)
 	if err != nil {
 		return
 	}
@@ -185,26 +202,55 @@ func getVal(ctx context.Context, client *rpchttp.HTTP, valoper string) (pub []by
 		return nil, "", false, false, 0, errors.New("got invalid consensus pubkey for " + valoper)
 	}
 
-	pubBytes := make([]byte, 0)
-	switch val.Validator.ConsensusPubkey.TypeUrl {
-	case "/cosmos.crypto.ed25519.PubKey":
-		pk := ed25519.PubKey{}
-		err = pk.Unmarshal(val.Validator.ConsensusPubkey.Value)
-		if err != nil {
-			return
-		}
-		pubBytes = pk.Address().Bytes()
-	case "/cosmos.crypto.secp256k1.PubKey":
-		pk := secp256k1.PubKey{}
-		err = pk.Unmarshal(val.Validator.ConsensusPubkey.Value)
-		if err != nil {
-			return
-		}
-		pubBytes = pk.Address().Bytes()
-	}
-	if len(pubBytes) == 0 {
-		return nil, "", false, false, 0, errors.New("could not get pubkey for" + valoper)
+	pubBytes, err := consAddress(val.Validator.ConsensusPubkey)
+	if err != nil {
+		return nil, "", false, false, 0, fmt.Errorf("could not get pubkey for %s: %w", valoper, err)
 	}
 
 	return pubBytes, val.Validator.GetMoniker(), val.Validator.Jailed, val.Validator.Status == 3, toFloat(val.Validator.Tokens), nil
+}
+
+// consAddress is the consensus address bytes behind a validator's packed consensus public key.
+func consAddress(key *codectypes.Any) ([]byte, error) {
+	switch key.TypeUrl {
+	case "/cosmos.crypto.ed25519.PubKey":
+		pk := ed25519.PubKey{}
+		if err := pk.Unmarshal(key.Value); err != nil {
+			return nil, err
+		}
+		return pk.Address().Bytes(), nil
+	case "/cosmos.crypto.secp256k1.PubKey":
+		pk := secp256k1.PubKey{}
+		if err := pk.Unmarshal(key.Value); err != nil {
+			return nil, err
+		}
+		return pk.Address().Bytes(), nil
+	}
+	return nil, errors.New("unknown key type " + key.TypeUrl)
+}
+
+// findOperator walks the bonded validator set for the one whose consensus key matches valcons and returns its
+// operator address.
+func findOperator(ctx context.Context, client *rpchttp.HTTP, valcons string) (string, error) {
+	_, want, err := bech32.DecodeAndConvert(valcons)
+	if err != nil {
+		return "", err
+	}
+	var next []byte
+	for {
+		res := &staking.QueryValidatorsResponse{}
+		req := &staking.QueryValidatorsRequest{Status: "BOND_STATUS_BONDED", Pagination: &query.PageRequest{Key: next, Limit: 200}}
+		if err := abciQuery(ctx, client, "/cosmos.staking.v1beta1.Query/Validators", req, res); err != nil {
+			return "", err
+		}
+		for _, v := range res.Validators {
+			if addr, e := consAddress(v.ConsensusPubkey); e == nil && bytes.Equal(addr, want) {
+				return v.OperatorAddress, nil
+			}
+		}
+		if res.Pagination == nil || len(res.Pagination.NextKey) == 0 {
+			return "", errors.New("not in the bonded validator set")
+		}
+		next = res.Pagination.NextKey
+	}
 }

@@ -98,7 +98,7 @@ func (cc *ChainConfig) refreshUpgrade(ctx context.Context) error {
 // refreshProposals lists proposals in their voting period and whether the validator voted on each. Chains that
 // only answer the older gov v1beta1 queries are detected on the first attempt and remembered.
 func (cc *ChainConfig) refreshProposals(ctx context.Context) error {
-	voter, err := accountAddress(cc.ValAddress)
+	voter, err := accountAddress(cc.operator)
 	if err != nil {
 		return err
 	}
@@ -249,7 +249,7 @@ func (cc *ChainConfig) refreshGov() {
 	}
 	// no voter to check for on an rpc-only chain, and consumer chains (identified by consensus address) run
 	// without a governance module
-	if (wanted || cc.Alerts.GovAlerts) && !cc.rpcOnly() && !strings.Contains(cc.ValAddress, "valcons") {
+	if (wanted || cc.Alerts.GovAlerts) && cc.operator != "" {
 		if err := cc.refreshProposals(ctx); err != nil {
 			problems = append(problems, "proposals: "+err.Error())
 		}
@@ -367,15 +367,17 @@ func (cc *ChainConfig) alertGov() {
 			kind = "upgrade proposal"
 		}
 		ends := p.VotingEnd.UTC().Format("2006-01-02 15:04 UTC")
+		// both notices share one id, so PagerDuty sees one incident per proposal
 		id := *cc.alertId(fmt.Sprintf("gov%d", p.ID))
-		if a.msg == "" {
+		final := time.Until(p.VotingEnd) < time.Duration(cc.Alerts.GovFinalHours)*time.Hour
+		// a proposal first seen inside its final window gets the final notice only, not both at once
+		if a.msg == "" && a.finalMsg == "" && !final {
 			a.msg = fmt.Sprintf("%s #%d (%s) on %s is open for voting until %s and %s has not voted", kind, p.ID, p.Title, cc.ChainId, ends, cc.valInfo.Moniker)
 			td.alert(cc.name, a.msg, cc.Alerts.GovPriority, false, &id)
 		}
-		if a.finalMsg == "" && time.Until(p.VotingEnd) < time.Duration(cc.Alerts.GovFinalHours)*time.Hour {
-			idf := id + "final"
+		if a.finalMsg == "" && final {
 			a.finalMsg = fmt.Sprintf("%s #%d (%s) on %s closes in under %d hours (%s) and %s has still not voted", kind, p.ID, p.Title, cc.ChainId, cc.Alerts.GovFinalHours, ends, cc.valInfo.Moniker)
-			td.alert(cc.name, a.finalMsg, cc.Alerts.GovPriority, false, &idf)
+			td.alert(cc.name, a.finalMsg, cc.Alerts.GovPriority, false, &id)
 		}
 	}
 	for pid, a := range cc.govAlarms {
@@ -383,12 +385,11 @@ func (cc *ChainConfig) alertGov() {
 			continue
 		}
 		id := *cc.alertId(fmt.Sprintf("gov%d", pid))
-		idf := id + "final"
 		if a.msg != "" {
 			td.alert(cc.name, a.msg, "info", true, &id)
 		}
 		if a.finalMsg != "" {
-			td.alert(cc.name, a.finalMsg, "info", true, &idf)
+			td.alert(cc.name, a.finalMsg, "info", true, &id)
 		}
 		delete(cc.govAlarms, pid)
 	}

@@ -8,204 +8,252 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"sync"
 	"time"
 
-	dash "github.com/blockpane/tenderduty/v2/td2/dashboard"
-	rpchttp "github.com/tendermint/tendermint/rpc/client/http"
+	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
 )
 
-// newRpc sets up the rpc client used for monitoring. It will try nodes in order until a working node is found.
-// it will also get some initial info on the validator's status.
-func (cc *ChainConfig) newRpc() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+const (
+	probeTimeout = 10 * time.Second
+	// wsFailPenalty is how long a node is passed over after its websocket stopped delivering blocks.
+	wsFailPenalty = 10 * time.Minute
+)
+
+var errSyncing = errors.New("not synced")
+
+// probeResult is what one node reported when asked for its status.
+type probeResult struct {
+	node      *NodeConfig
+	height    int64
+	blockTime time.Time
+	err       error
+}
+
+// probe asks a node for its status and reports how far along it is. Each call has its own timeout so one
+// unresponsive node cannot eat into the time budget of the others.
+func probe(u, chainID string) (height int64, blockTime time.Time, err error) {
+	if _, err = url.Parse(u); err != nil {
+		return 0, time.Time{}, fmt.Errorf("could not parse url: %w", err)
+	}
+	c, err := rpchttp.New(u, "/websocket")
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("could not create client: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
 	defer cancel()
-	var anyWorking bool // if healthchecks are running, we will skip to the first known good node.
-	for _, endpoint := range cc.Nodes {
-		anyWorking = anyWorking || !endpoint.down
+	status, err := c.Status(ctx)
+	if err != nil {
+		return 0, time.Time{}, fmt.Errorf("down: %w", err)
 	}
-	// grab the first working endpoint
-	tryUrl := func(u string) (msg string, down, syncing bool) {
-		_, err := url.Parse(u)
-		if err != nil {
-			msg = fmt.Sprintf("❌ could not parse url %s: (%s) %s", cc.name, u, err)
-			l(msg)
-			down = true
-			return
-		}
-		cc.client, err = rpchttp.New(u, "/websocket")
-		if err != nil {
-			msg = fmt.Sprintf("❌ could not connect client for %s: (%s) %s", cc.name, u, err)
-			l(msg)
-			down = true
-			return
-		}
-		status, err := cc.client.Status(ctx)
-		if err != nil {
-			msg = fmt.Sprintf("❌ could not get status for %s: (%s) %s", cc.name, u, err)
-			down = true
-			l(msg)
-			return
-		}
-		if status.NodeInfo.Network != cc.ChainId {
-			msg = fmt.Sprintf("chain id %s on %s does not match, expected %s, skipping", status.NodeInfo.Network, u, cc.ChainId)
-			down = true
-			l(msg)
-			return
-		}
-		if status.SyncInfo.CatchingUp {
-			msg = fmt.Sprint("🐢 node is not synced, skipping ", u)
-			syncing = true
-			down = true
-			l(msg)
-			return
-		}
-		cc.noNodes = false
-		return
+	if status.NodeInfo.Network != chainID {
+		return 0, time.Time{}, fmt.Errorf("on the wrong network: %s, expected %s", status.NodeInfo.Network, chainID)
 	}
-	down := func(endpoint *NodeConfig, msg string) {
-		if !endpoint.down {
-			endpoint.down = true
-			endpoint.downSince = time.Now()
-		}
-		endpoint.lastMsg = msg
+	if status.SyncInfo.CatchingUp {
+		return 0, time.Time{}, errSyncing
 	}
-	for _, endpoint := range cc.Nodes {
-		if anyWorking && endpoint.down {
+	return status.SyncInfo.LatestBlockHeight, status.SyncInfo.LatestBlockTime, nil
+}
+
+// probeAll checks every configured node at the same time.
+func (cc *ChainConfig) probeAll() []probeResult {
+	results := make([]probeResult, len(cc.Nodes))
+	var wg sync.WaitGroup
+	for i, node := range cc.Nodes {
+		wg.Add(1)
+		go func(i int, node *NodeConfig) {
+			defer wg.Done()
+			h, t, err := probe(node.Url, cc.ChainId)
+			results[i] = probeResult{node: node, height: h, blockTime: t, err: err}
+		}(i, node)
+	}
+	wg.Wait()
+	return results
+}
+
+// best is the highest height and newest block time any reachable node reported.
+func best(results []probeResult) (height int64, blockTime time.Time) {
+	for _, r := range results {
+		if r.err != nil {
 			continue
 		}
-		if msg, failed, syncing := tryUrl(endpoint.Url); failed {
-			endpoint.syncing = syncing
-			down(endpoint, msg)
+		if r.height > height {
+			height = r.height
+		}
+		if r.blockTime.After(blockTime) {
+			blockTime = r.blockTime
+		}
+	}
+	return
+}
+
+// pickNode chooses which node to monitor from. The highest block height wins and ties go to config order.
+// Nodes that errored or sit more than maxLag blocks behind are skipped. Nodes whose websocket failed recently
+// are only chosen when nothing else is reachable, so a node that answers status calls but delivers no blocks
+// is not selected over and over.
+func pickNode(results []probeResult, maxLag int64, now time.Time) int {
+	top, _ := best(results)
+	pick, pickHeight, pickPenalised := -1, int64(-1), true
+	for i, r := range results {
+		if r.err != nil || top-r.height > maxLag {
 			continue
 		}
-		return nil
+		penalised := now.Sub(r.node.wsFailedAt) < wsFailPenalty
+		if pick == -1 || (pickPenalised && !penalised) || (penalised == pickPenalised && r.height > pickHeight) {
+			pick, pickHeight, pickPenalised = i, r.height, penalised
+		}
+	}
+	return pick
+}
+
+// applyProbes records each node's probe outcome and returns the index of the node to use, or -1.
+func (cc *ChainConfig) applyProbes(results []probeResult) int {
+	top, topTime := best(results)
+	for _, r := range results {
+		node := r.node
+		node.height, node.lag = r.height, 0
+		node.syncing = errors.Is(r.err, errSyncing)
+		switch {
+		case r.err != nil:
+			cc.markDown(node, r.err.Error())
+		case top-r.height > int64(td.LagBlocks):
+			node.lag = top - r.height
+			cc.markDown(node, fmt.Sprintf("lagging %d blocks behind", node.lag))
+		default:
+			node.lag = top - r.height
+			cc.markUp(node)
+		}
+		if td.Prom && r.err == nil {
+			td.statsChan <- cc.mkUpdate(metricNodeLagSeconds, topTime.Sub(r.blockTime).Seconds(), node.Url)
+		}
+	}
+	return pickNode(results, int64(td.LagBlocks), time.Now())
+}
+
+// markDown records that a node cannot be used and why. The transition is logged once, later probes only
+// refresh the message.
+func (cc *ChainConfig) markDown(node *NodeConfig, msg string) {
+	node.lastMsg = msg
+	if !node.down {
+		node.down = true
+		node.downSince = time.Now()
+		l(fmt.Sprintf("⚠️ %-12s node %s is %s", cc.name, node.Url, msg))
+	}
+	if td.Prom {
+		td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, time.Since(node.downSince).Seconds(), node.Url)
+	}
+}
+
+// markUp records that a node answered correctly.
+func (cc *ChainConfig) markUp(node *NodeConfig) {
+	if node.down {
+		node.wasDown = true
+		l(fmt.Sprintf("🟢 %-12s node %s is healthy again", cc.name, node.Url))
+	}
+	node.down, node.lastMsg, node.downSince = false, "", time.Time{}
+	if td.Prom {
+		td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, 0, node.Url)
+	}
+}
+
+// useNode points the RPC client at a node.
+func (cc *ChainConfig) useNode(u string) error {
+	c, err := rpchttp.New(u, "/websocket")
+	if err != nil {
+		return err
+	}
+	cc.clientMux.Lock()
+	cc.client = c
+	cc.currentUrl = u
+	cc.clientMux.Unlock()
+	cc.noNodes = false
+	cc.lastError = ""
+	return nil
+}
+
+// currentNode is the configured node the RPC client is pointed at, nil when none or when using the public fallback.
+func (cc *ChainConfig) currentNode() *NodeConfig {
+	for _, n := range cc.Nodes {
+		if n.Url == cc.currentUrl {
+			return n
+		}
+	}
+	return nil
+}
+
+// closeWs drops the websocket so the run loop reconnects through newRpc.
+func (cc *ChainConfig) closeWs() {
+	cc.clientMux.Lock()
+	defer cc.clientMux.Unlock()
+	if cc.wsclient != nil {
+		_ = cc.wsclient.Close()
+	}
+}
+
+// newRpc points the RPC client at the best node available. Every node is probed at once and the one with the
+// highest block height wins.
+func (cc *ChainConfig) newRpc() error {
+	if i := cc.applyProbes(cc.probeAll()); i >= 0 {
+		return cc.useNode(cc.Nodes[i].Url)
 	}
 	if cc.PublicFallback {
 		if u, ok := getRegistryUrl(cc.ChainId); ok {
 			node := guessPublicEndpoint(u)
-			l(cc.ChainId, "⛑ attemtping to use public fallback node", node)
-			if _, kk, _ := tryUrl(node); !kk {
+			l(cc.ChainId, "⛑ attempting to use public fallback node", node)
+			if _, _, err := probe(node, cc.ChainId); err == nil {
 				l(cc.ChainId, "⛑ connected to public endpoint", node)
-				return nil
+				return cc.useNode(node)
 			}
 		} else {
 			l("could not find a public endpoint for", cc.ChainId)
 		}
 	}
 	cc.noNodes = true
-	alarms.clearAll(cc.name)
 	cc.lastError = "no usable RPC endpoints available for " + cc.ChainId
-	if td.EnableDash {
-		td.updateChan <- &dash.ChainStatus{
-			MsgType:      "status",
-			Name:         cc.name,
-			ChainId:      cc.ChainId,
-			Moniker:      cc.valInfo.Moniker,
-			Bonded:       cc.valInfo.Bonded,
-			Jailed:       cc.valInfo.Jailed,
-			Tombstoned:   cc.valInfo.Tombstoned,
-			Missed:       cc.valInfo.Missed,
-			Window:       cc.valInfo.Window,
-			Nodes:        len(cc.Nodes),
-			HealthyNodes: 0,
-			ActiveAlerts: 1,
-			Height:       0,
-			LastError:    cc.lastError,
-			Blocks:       cc.blocksResults,
-		}
-	}
+	cc.pushStatus()
 	return errors.New("no usable endpoints available for " + cc.ChainId)
 }
 
-func (cc *ChainConfig) monitorHealth(ctx context.Context, chainName string) {
+// monitorHealth probes every node once a minute, refreshes the validator's state, and moves the websocket off
+// the node in use when it is down or lagging while another node is healthy.
+func (cc *ChainConfig) monitorHealth(ctx context.Context) {
 	tick := time.NewTicker(time.Minute)
-	if cc.client == nil {
-		_ = cc.newRpc()
-	}
-
+	defer tick.Stop()
 	for {
+		// the run loop does the first probe and validator lookup itself, so this waits a tick to avoid racing it
 		select {
 		case <-ctx.Done():
 			return
-
 		case <-tick.C:
-			var err error
-			for _, node := range cc.Nodes {
-				go func(node *NodeConfig) {
-					alert := func(msg string) {
-						node.lastMsg = fmt.Sprintf("%-12s node %s is %s", chainName, node.Url, msg)
-						if !node.AlertIfDown {
-							// even if we aren't alerting, we want to display the status in the dashboard.
-							node.down = true
-							return
-						}
-						if !node.down {
-							node.down = true
-							node.downSince = time.Now()
-						}
-						if td.Prom {
-							td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, time.Since(node.downSince).Seconds(), node.Url)
-						}
-						l("⚠️ " + node.lastMsg)
-					}
-					c, e := rpchttp.New(node.Url, "/websocket")
-					if e != nil {
-						alert(e.Error())
-					}
-					cwt, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-					status, e := c.Status(cwt)
-					cancel()
-					if e != nil {
-						alert("down")
-						return
-					}
-					if status.NodeInfo.Network != cc.ChainId {
-						alert("on the wrong network")
-						return
-					}
-					if status.SyncInfo.CatchingUp {
-						alert("not synced")
-						node.syncing = true
-						return
-					}
-
-					// node's OK, clear the note
-					if node.down {
-						node.lastMsg = ""
-						node.wasDown = true
-					}
-					td.statsChan <- cc.mkUpdate(metricNodeDownSeconds, 0, node.Url)
-					node.down = false
-					node.syncing = false
-					node.downSince = time.Unix(0, 0)
-					cc.noNodes = false
-					l(fmt.Sprintf("🟢 %-12s node %s is healthy", chainName, node.Url))
-				}(node)
-			}
-
-			if cc.client == nil {
-				e := cc.newRpc()
-				if e != nil {
-					l("💥", cc.ChainId, e)
-				}
-			}
-			if cc.valInfo != nil {
-				cc.lastValInfo = &ValInfo{
-					Moniker:    cc.valInfo.Moniker,
-					Bonded:     cc.valInfo.Bonded,
-					Jailed:     cc.valInfo.Jailed,
-					Tombstoned: cc.valInfo.Tombstoned,
-					Missed:     cc.valInfo.Missed,
-					Window:     cc.valInfo.Window,
-					Conspub:    cc.valInfo.Conspub,
-					Valcons:    cc.valInfo.Valcons,
-				}
-			}
-			err = cc.GetValInfo(false)
-			if err != nil {
-				l("❓ refreshing signing info for", cc.ValAddress, err)
+		}
+		if i := cc.applyProbes(cc.probeAll()); i >= 0 {
+			current := cc.currentNode()
+			switch {
+			case current != nil && current.down:
+				l(fmt.Sprintf("🔀 %-12s moving from %s to %s", cc.name, current.Url, cc.Nodes[i].Url))
+				cc.closeWs()
+			case current == nil && cc.currentUrl != "":
+				// running on the public fallback and one of our own nodes is back
+				l(fmt.Sprintf("🔀 %-12s moving from public fallback %s back to %s", cc.name, cc.currentUrl, cc.Nodes[i].Url))
+				cc.closeWs()
 			}
 		}
+		if cc.client != nil {
+			if !cc.rpcOnly() {
+				if cc.valInfo != nil {
+					v := *cc.valInfo
+					cc.lastValInfo = &v
+				}
+				if err := cc.GetValInfo(false); err != nil {
+					l("❓ refreshing signing info for", cc.ValAddress, err)
+				}
+			}
+			cc.refreshGov()
+			cc.alertUpgrade()
+			cc.alertGov()
+			cc.alertVotingPower()
+		}
+		cc.pushStatus()
 	}
 }
 
@@ -213,20 +261,17 @@ func (c *Config) pingHealthcheck() {
 	if !c.Healthcheck.Enabled {
 		return
 	}
-
 	ticker := time.NewTicker(c.Healthcheck.PingRate * time.Second)
-
+	client := &http.Client{Timeout: 10 * time.Second}
 	go func() {
-		for {
-			select {
-			case <-ticker.C:
-				_, err := http.Get(c.Healthcheck.PingURL)
-				if err != nil {
-					l(fmt.Sprintf("❌ Failed to ping healthcheck URL: %s", err.Error()))
-				} else {
-					l(fmt.Sprintf("🏓 Successfully pinged healthcheck URL: %s", c.Healthcheck.PingURL))
-				}
+		for range ticker.C {
+			resp, err := client.Get(c.Healthcheck.PingURL)
+			if err != nil {
+				l(fmt.Sprintf("❌ Failed to ping healthcheck URL: %s", err.Error()))
+				continue
 			}
+			_ = resp.Body.Close()
+			l(fmt.Sprintf("🏓 Successfully pinged healthcheck URL: %s", c.Healthcheck.PingURL))
 		}
 	}()
 }

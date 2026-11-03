@@ -34,6 +34,11 @@ const (
 	metricUnealthyNodes
 	metricNodeLagSeconds
 	metricNodeDownSeconds
+
+	metricUpgradeBlocksRemaining
+	metricUnvotedProposals
+	metricVotingPowerTokens
+	metricVotingPowerPercent
 )
 
 type promUpdate struct {
@@ -48,6 +53,10 @@ type promUpdate struct {
 type metrics map[metricType]*prometheus.GaugeVec
 
 func (m metrics) setStat(update *promUpdate) {
+	if update.moniker == "not connected" {
+		// the validator is not known yet, a sample now would create a second label set that never updates again
+		return
+	}
 	lbls := map[string]string{
 		"name":     update.name,
 		"chain_id": update.chainId,
@@ -128,6 +137,23 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 		Help: "how many seconds a node has been marked as unhealthy",
 	}, hostLabels)
 
+	upgradeBlocks := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tenderduty_upgrade_blocks_remaining",
+		Help: "blocks until the scheduled x/upgrade height, -1 when no upgrade is scheduled",
+	}, chainLabels)
+	unvotedProposals := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tenderduty_unvoted_proposals",
+		Help: "count of proposals in their voting period that the validator has not voted on",
+	}, chainLabels)
+	votingPowerTokens := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tenderduty_voting_power_tokens",
+		Help: "stake delegated to the validator in the chain's base denomination",
+	}, chainLabels)
+	votingPowerPercent := promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "tenderduty_voting_power_percent",
+		Help: "the validator's share of all bonded tokens on the chain",
+	}, chainLabels)
+
 	m := metrics{
 		metricSigned:                   signed,
 		metricProposed:                 proposed,
@@ -141,8 +167,12 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 		metricLastBlockSecondsNotFinal: lastBlockSecUnfinalized,
 		metricTotalNodes:               nodesMonitored,
 		metricUnealthyNodes:            nodesUnhealthy,
-		metricNodeLagSeconds:           nodeLagSec,  // todo
-		metricNodeDownSeconds:          nodeDownSec, // todo
+		metricNodeLagSeconds:           nodeLagSec,
+		metricNodeDownSeconds:          nodeDownSec,
+		metricUpgradeBlocksRemaining:   upgradeBlocks,
+		metricUnvotedProposals:         unvotedProposals,
+		metricVotingPowerTokens:        votingPowerTokens,
+		metricVotingPowerPercent:       votingPowerPercent,
 	}
 
 	go func() {
@@ -158,7 +188,7 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 
 	promMux := http.NewServeMux()
 
-	l("serving prometheus metrics at 0.0.0.0:%d/metrics", td.PrometheusListenPort)
+	l(fmt.Sprintf("serving prometheus metrics at 0.0.0.0:%d/metrics", td.PrometheusListenPort))
 	promMux.Handle("/metrics", promhttp.Handler())
 	promSrv := &http.Server{
 		Addr:              fmt.Sprintf(":%d", td.PrometheusListenPort),

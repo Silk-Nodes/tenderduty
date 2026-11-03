@@ -9,7 +9,7 @@ import (
 	"os"
 	"syscall"
 
-	td2 "github.com/blockpane/tenderduty/v2/td2"
+	td2 "github.com/Silk-Nodes/tenderduty/v2/td2"
 )
 
 //go:embed example-config.yml
@@ -53,13 +53,7 @@ func main() {
 			pass = nil
 		}
 
-		var e error
-		if encryptConfig {
-			e = td2.EncryptedConfig(configFile, encryptedFile, password, false)
-		} else {
-			e = td2.EncryptedConfig(configFile, encryptedFile, password, true)
-		}
-		if e != nil {
+		if e := td2.EncryptedConfig(configFile, encryptedFile, password, decryptConfig); e != nil {
 			log.Fatalln(e)
 		}
 		os.Exit(0)

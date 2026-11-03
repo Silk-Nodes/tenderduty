@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	dash "github.com/blockpane/tenderduty/v2/td2/dashboard"
+	pbtypes "github.com/cometbft/cometbft/proto/tendermint/types"
 	"github.com/gorilla/websocket"
-	pbtypes "github.com/tendermint/tendermint/proto/tendermint/types"
 	"log"
 	"net/url"
 	"strconv"
@@ -76,7 +75,7 @@ func (cc *ChainConfig) WsRun() {
 	started := time.Now()
 	for {
 		// wait until our RPC client is connected and running. We will use the same URL for the websocket
-		if cc.client == nil || cc.valInfo == nil || cc.valInfo.Conspub == nil {
+		if cc.client == nil || cc.valInfo == nil || (cc.valInfo.Conspub == nil && !cc.rpcOnly()) {
 			if started.Before(time.Now().Add(-2 * time.Minute)) {
 				l(cc.name, "websocket client timed out waiting for a working rpc endpoint, restarting")
 				return
@@ -88,14 +87,17 @@ func (cc *ChainConfig) WsRun() {
 		break
 	}
 
-	cc.wsclient, err = NewClient(cc.client.Remote(), true)
+	ws, err := newWsClient(cc.currentUrl)
 	if err != nil {
 		l(err)
 		cancel()
 		return
 	}
-	defer cc.wsclient.Close()
-	err = cc.wsclient.SetCompressionLevel(3)
+	cc.clientMux.Lock()
+	cc.wsclient = ws
+	cc.clientMux.Unlock()
+	defer ws.Close()
+	err = ws.SetCompressionLevel(3)
 	if err != nil {
 		log.Println(err)
 	}
@@ -116,17 +118,24 @@ func (cc *ChainConfig) WsRun() {
 				}
 				if update.Final {
 					cc.lastBlockNum = update.Height
-					if td.Prom {
-						td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
+					if !cc.lastBlockTime.IsZero() {
+						if td.Prom {
+							td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
+						}
+						// smoothed block interval, used to estimate when an upgrade height will arrive
+						if d := time.Since(cc.lastBlockTime).Seconds(); d < 60 {
+							if cc.avgBlockTime == 0 {
+								cc.avgBlockTime = d
+							} else {
+								cc.avgBlockTime = 0.9*cc.avgBlockTime + 0.1*d
+							}
+						}
 					}
 					cc.lastBlockTime = time.Now()
-					cc.lastBlockAlarm = false
-					info := getAlarms(cc.name)
 					cc.blocksResults = append([]int{int(signState)}, cc.blocksResults[:len(cc.blocksResults)-1]...)
 					if signState < 3 && cc.valInfo.Bonded {
 						warn := fmt.Sprintf("❌ warning      %s missed block %d on %s", cc.valInfo.Moniker, update.Height, cc.ChainId)
-						info += warn + "\n"
-						cc.lastError = time.Now().UTC().String() + " " + info
+						cc.lastError = time.Now().UTC().Format(time.RFC3339) + " " + warn
 						l(warn)
 					}
 					switch signState {
@@ -150,40 +159,7 @@ func (cc *ChainConfig) WsRun() {
 						cc.statConsecutiveMiss = 0
 					}
 					signState = -1
-					healthyNodes := 0
-					for i := range cc.Nodes {
-						if !cc.Nodes[i].down {
-							healthyNodes += 1
-						} else if !td.HideLogs { // only show this info if sending logs, the point is not to leak host info
-							info += "\n - " + cc.Nodes[i].lastMsg
-						}
-					}
-					switch {
-					case cc.valInfo.Tombstoned:
-						info += "- validator is tombstoned\n"
-					case cc.valInfo.Jailed:
-						info += "- validator is jailed\n"
-					}
-					cc.activeAlerts = alarms.getCount(cc.name)
-					if td.EnableDash {
-						td.updateChan <- &dash.ChainStatus{
-							MsgType:      "status",
-							Name:         cc.name,
-							ChainId:      cc.ChainId,
-							Moniker:      cc.valInfo.Moniker,
-							Bonded:       cc.valInfo.Bonded,
-							Jailed:       cc.valInfo.Jailed,
-							Tombstoned:   cc.valInfo.Tombstoned,
-							Missed:       cc.valInfo.Missed,
-							Window:       cc.valInfo.Window,
-							Nodes:        len(cc.Nodes),
-							HealthyNodes: healthyNodes,
-							ActiveAlerts: cc.activeAlerts,
-							Height:       update.Height,
-							LastError:    info,
-							Blocks:       cc.blocksResults,
-						}
-					}
+					cc.pushStatus()
 
 					if td.Prom {
 						td.statsChan <- cc.mkUpdate(metricSigned, cc.statTotalSigns, "")
@@ -192,7 +168,7 @@ func (cc *ChainConfig) WsRun() {
 						td.statsChan <- cc.mkUpdate(metricPrevote, cc.statPrevoteMiss, "")
 						td.statsChan <- cc.mkUpdate(metricPrecommit, cc.statPrecommitMiss, "")
 						td.statsChan <- cc.mkUpdate(metricConsecutive, cc.statConsecutiveMiss, "")
-						td.statsChan <- cc.mkUpdate(metricUnealthyNodes, float64(len(cc.Nodes)-healthyNodes), "")
+						td.statsChan <- cc.mkUpdate(metricUnealthyNodes, float64(len(cc.Nodes)-cc.healthyNodes()), "")
 					}
 				}
 			case <-ctx.Done():
@@ -218,7 +194,7 @@ func (cc *ChainConfig) WsRun() {
 		var msg []byte
 		var e error
 		for {
-			_, msg, e = cc.wsclient.ReadMessage()
+			_, msg, e = ws.ReadMessage()
 			if e != nil {
 				l(e)
 				cancel()
@@ -240,16 +216,21 @@ func (cc *ChainConfig) WsRun() {
 		}
 	}()
 
-	for _, subscribe := range []string{QueryNewBlock, QueryVote} {
+	subscriptions := []string{QueryNewBlock, QueryVote}
+	if cc.rpcOnly() {
+		// without a validator there is nothing to learn from votes, blocks alone give height and timing
+		subscriptions = subscriptions[:1]
+	}
+	for _, subscribe := range subscriptions {
 		q := fmt.Sprintf(`{"jsonrpc":"2.0","method":"subscribe","id":1,"params":{"query":"%s"}}`, subscribe)
-		err = cc.wsclient.WriteMessage(websocket.TextMessage, []byte(q))
+		err = ws.WriteMessage(websocket.TextMessage, []byte(q))
 		if err != nil {
 			l(err)
 			cancel()
 			break
 		}
 	}
-	l(fmt.Sprintf("⚙️ %-12s watching for NewBlock and Vote events via %s", cc.ChainId, cc.client.Remote()))
+	l(fmt.Sprintf("⚙️ %-12s watching for %s via %s", cc.ChainId, strings.Join(subscriptions, " and "), cc.currentUrl))
 	for {
 		select {
 		case <-cc.client.Quit():
@@ -377,61 +358,28 @@ func handleVotes(ctx context.Context, votes chan *WsReply, results chan StatusUp
 	}
 }
 
-// TmConn is the websocket client. This is probably not necessary since I expected more complexity.
-type TmConn struct {
-	*websocket.Conn
-}
-
-// NewClient returns a websocket client.
-// FIXME: need to handle UDS and insecure TLS
-func NewClient(u string, allowInsecure bool) (*TmConn, error) {
-	// dialUnix is used to determine if the connection is to a UDS and requires a custom dialer.
-	var dialUnix bool
-
-	// normalize the path, some public rpcs prefix with /rpc or similar.
+// newWsClient dials the websocket endpoint of an RPC node. Public nodes sometimes serve RPC under a path prefix,
+// so the /websocket suffix is only added when missing.
+func newWsClient(u string) (*websocket.Conn, error) {
 	u = strings.TrimRight(u, "/")
 	if !strings.HasSuffix(u, "/websocket") {
 		u += "/websocket"
 	}
-
 	endpoint, err := url.Parse(u)
 	if err != nil {
-		return nil, fmt.Errorf("parsing url in NewWsClient %s: %s", u, err.Error())
+		return nil, fmt.Errorf("parsing websocket url %s: %w", u, err)
 	}
-
-	// normalize scheme to ws or wss
 	switch endpoint.Scheme {
 	case "http", "tcp", "ws":
-		endpoint.Scheme = "ws"
-	case "unix":
-		dialUnix = true
 		endpoint.Scheme = "ws"
 	case "https", "wss":
 		endpoint.Scheme = "wss"
 	default:
-		return nil, fmt.Errorf("protocol %s is unknown, valid choices are http, https, tcp, unix, ws, and wss", endpoint.Scheme)
+		return nil, fmt.Errorf("protocol %s is unknown, valid choices are http, https, tcp, ws, and wss", endpoint.Scheme)
 	}
-
-	// allowInsecure is primarily intended for self-signed certs, but it doesn't make sense to allow yes to for non-tls
-	if endpoint.Scheme == "ws" && !allowInsecure {
-		return nil, errors.New("allowInsecure must be true if protocol is not using TLS")
+	conn, _, err := websocket.DefaultDialer.Dial(endpoint.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("could not dial websocket %s: %w", endpoint.String(), err)
 	}
-
-	conn := &websocket.Conn{}
-
-	switch {
-
-	// TODO: add custom UDS dialer
-	case dialUnix:
-
-	// TODO: add custom TLS dialer to allow self-signed certs.
-	// case allowInsecure && endpoint.Scheme == "wss":
-
-	default:
-		conn, _, err = websocket.DefaultDialer.Dial(endpoint.String(), nil)
-		if err != nil {
-			return nil, fmt.Errorf("could not dial ws client to %s: %s", endpoint.String(), err.Error())
-		}
-	}
-	return &TmConn{Conn: conn}, nil
+	return conn, nil
 }

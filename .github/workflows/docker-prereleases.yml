@@ -1,4 +1,4 @@
-name: Docker
+name: Docker dev
 
 # This workflow uses actions that are not certified by GitHub.
 # They are provided by a third-party and are governed by
@@ -8,8 +8,7 @@ name: Docker
 on:
   push:
     branches:
-      #- "release/*"
-      - feature/*
+      - dev
     # Publish semver tags as releases.
     #tags:
     #  - 'v*.*.*'
@@ -72,5 +71,5 @@ jobs:
         with:
           context: .
           push: ${{ github.event_name != 'pull_request' }}
-          tags: ghcr.io/${{ github.repository }}:feature-${{ steps.date.outputs.date }}
+          tags: ghcr.io/${{ github.repository }}:dev,ghcr.io/${{ github.repository }}:dev-${{ steps.date.outputs.date }}
           labels: ${{ steps.meta.outputs.labels }}

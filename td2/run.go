@@ -9,7 +9,7 @@ import (
 	"syscall"
 	"time"
 
-	dash "github.com/blockpane/tenderduty/v2/td2/dashboard"
+	dash "github.com/Silk-Nodes/tenderduty/v2/td2/dashboard"
 )
 
 var td = &Config{}
@@ -88,16 +88,12 @@ func Run(configFile, stateFile, chainConfigDirectory string, password *string) e
 	for k := range td.Chains {
 		cc := td.Chains[k]
 
-		go func(cc *ChainConfig, name string) {
+		go func(cc *ChainConfig) {
 			// alert worker
 			go cc.watch()
 
 			// node health checks:
-			go func() {
-				for {
-					cc.monitorHealth(td.ctx, name)
-				}
-			}()
+			go cc.monitorHealth(td.ctx)
 
 			// websocket subscription and occasional validator info refreshes
 			for {
@@ -107,15 +103,24 @@ func Run(configFile, stateFile, chainConfigDirectory string, password *string) e
 					time.Sleep(5 * time.Second)
 					continue
 				}
-				e = cc.GetValInfo(true)
-				if e != nil {
-					l("🛑", cc.ChainId, e)
+				if !cc.rpcOnly() {
+					if e = cc.GetValInfo(true); e != nil {
+						l("🛑", cc.ChainId, e)
+					}
 				}
+				started := time.Now()
 				cc.WsRun()
-				l(cc.ChainId, "🌀 websocket exited! Restarting monitoring")
+				// a websocket that dies within minutes of connecting points at a node that answers status
+				// calls but does not deliver blocks, so leave it alone for a while and try the others first.
+				if node := cc.currentNode(); node != nil && time.Since(started) < 2*time.Minute {
+					node.wsFailedAt = time.Now()
+					l(cc.ChainId, "🌀 websocket to", node.Url, "failed shortly after connecting, preferring other nodes")
+				} else {
+					l(cc.ChainId, "🌀 websocket exited! Restarting monitoring")
+				}
 				time.Sleep(5 * time.Second)
 			}
-		}(cc, k)
+		}(cc)
 	}
 
 	// attempt to save state on exit, only a best-effort ...

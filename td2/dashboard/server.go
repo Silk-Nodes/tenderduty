@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -55,18 +56,19 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 
 			case u := <-updates:
 				// try to catch any accidental rpc endpoint leaks
-				if hideLogs && rex.MatchString(u.LastError) {
-					rex.ReplaceAllString(u.LastError, "-redacted-")
+				if hideLogs {
+					u.LastError = rex.ReplaceAllString(u.LastError, "-redacted-")
+					for i := range u.NodeStatus {
+						u.NodeStatus[i].Message = rex.ReplaceAllString(u.NodeStatus[i].Message, "-redacted-")
+					}
 				}
-				statusMux.Lock() // probably unnecessary
 				status[u.Name] = u
 				result := make([]*ChainStatus, 0)
 				for k := range status {
 					result = append(result, status[k])
 				}
-				statusMux.Unlock()
 				sort.Slice(result, func(i, j int) bool {
-					return sort.StringsAreSorted([]string{result[i].Name, result[j].Name})
+					return result[i].Name < result[j].Name
 				})
 				j, e := json.Marshal(statusUpdate{
 					MessageType: "update",
@@ -75,7 +77,9 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 				if e != nil {
 					continue
 				}
+				statusMux.Lock()
 				statusCache = j
+				statusMux.Unlock()
 				update = true
 
 			case l := <-logs:
@@ -113,6 +117,15 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 		defer c.Close()
 		sub := cast.Listen()
 		defer sub.Discard()
+		// a fresh connection gets the current state at once rather than waiting for the next change
+		statusMux.Lock()
+		snapshot := statusCache
+		statusMux.Unlock()
+		if len(snapshot) > 0 {
+			if e := c.WriteMessage(websocket.TextMessage, snapshot); e != nil {
+				return
+			}
+		}
 		for message := range sub.Channel() {
 			e := c.WriteMessage(websocket.TextMessage, message.([]byte))
 			if e != nil {
@@ -137,6 +150,8 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 	http.HandleFunc("/state", func(writer http.ResponseWriter, request *http.Request) {
 		writer.Header().Set("Content-Type", "application/json")
 		writer.Header().Set("Access-Control-Allow-Origin", "*")
+		statusMux.Lock()
+		defer statusMux.Unlock()
 		_, _ = writer.Write(statusCache)
 	})
 
@@ -150,11 +165,17 @@ func Serve(port string, updates chan *ChainStatus, logs chan LogMessage, hideLog
 	log.Fatal("tenderduty dashboard server failed", err)
 }
 
-// CacheHandler implements the Handler interface with a Cache-Control set on responses
+// CacheHandler serves the static files. Vendored css and js may be cached for an hour, the page and its own
+// scripts are revalidated on every load so a new release shows up without clearing the browser cache.
 type CacheHandler struct{}
 
 func (ch CacheHandler) ServeHTTP(writer http.ResponseWriter, request *http.Request) {
-	writer.Header().Set("Cache-Control", "public, max-age=3600")
-	writer.Header().Set("X-Powered-By", "https://github.com/blockpane/tenderduty")
+	if strings.HasPrefix(request.URL.Path, "/css/") || strings.HasPrefix(request.URL.Path, "/js/") {
+		writer.Header().Set("Cache-Control", "public, max-age=3600")
+	} else {
+		writer.Header().Set("Cache-Control", "no-cache")
+	}
+	writer.Header().Set("X-Powered-By", "https://github.com/Silk-Nodes/tenderduty")
+	writer.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'")
 	http.FileServer(http.FS(rootDir)).ServeHTTP(writer, request)
 }

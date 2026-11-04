@@ -1,6 +1,9 @@
 package tenderduty
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestAlertFormatting(t *testing.T) {
 	msg := &alertMsg{chain: "Osmosis", chainId: "osmosis-1", severity: "info",
@@ -26,6 +29,24 @@ func TestAlertFormatting(t *testing.T) {
 	} {
 		if _, k := alertKind(text); k != kind {
 			t.Errorf("%q classified as %s, want %s", text, k, kind)
+		}
+	}
+}
+
+func TestListAlarmsOrder(t *testing.T) {
+	alarms.notifyMux.Lock()
+	alarms.AllAlarms["t"] = map[string]time.Time{
+		"proposal #1059 (x) on c is open for voting until 2026-11-06 22:08 UTC and v has not voted":         time.Unix(100, 0),
+		"proposal #1057 (y) on c closes in under 24 hours (2026-11-04 14:26 UTC) and v has still not voted": time.Unix(100, 0),
+		"proposal #1058 (z) on c is open for voting until 2026-11-04 14:28 UTC and v has not voted":         time.Unix(100, 0),
+		"RPC node http://a has been down for > 20 minutes on c":                                             time.Unix(200, 0),
+	}
+	alarms.notifyMux.Unlock()
+	got := listAlarms("t")
+	want := []string{"RPC node", "proposal #1057", "proposal #1058", "proposal #1059"}
+	for i, w := range want {
+		if len(got[i].Message) < len(w) || got[i].Message[:len(w)] != w {
+			t.Errorf("position %d = %q, want prefix %q", i, got[i].Message, w)
 		}
 	}
 }

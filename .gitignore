@@ -1,5 +1,8 @@
 config.yml
 config.yml.asc
+# any other local config, such as testnet-config.yml, but not the example
+*-config.yml
+!example-config.yml
 docker-compose.yml
 .tenderduty-state.json
 tenderduty-*

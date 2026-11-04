@@ -91,6 +91,12 @@ func (cc *ChainConfig) refreshUpgrade(ctx context.Context) error {
 	if err := abciQuery(ctx, cc.client, "/cosmos.upgrade.v1beta1.Query/CurrentPlan", &upgrade.QueryCurrentPlanRequest{}, resp); err != nil {
 		return err
 	}
+	// a node drops the plan the moment it has applied the upgrade, which can be while the chain is still halted
+	// waiting for enough validators. The upgrade only counts as done once a block past its height has been seen,
+	// so the plan is kept until then; a plan that vanishes well before its height was cancelled.
+	if resp.Plan == nil && cc.upgrade != nil && cc.lastBlockNum >= cc.upgrade.Height-1 && cc.lastBlockNum <= cc.upgrade.Height {
+		return nil
+	}
 	cc.upgrade = resp.Plan
 	return nil
 }
@@ -300,12 +306,16 @@ func (cc *ChainConfig) alertUpgrade() {
 	if cc.upgrade != nil {
 		key = fmt.Sprintf("%s@%d", cc.upgrade.Name, cc.upgrade.Height)
 	}
-	// the three notices share one alert id, so PagerDuty sees one incident and a finished upgrade sends one resolve
+	// the three notices share one alert id and one open alarm: each new notice takes over from the one before,
+	// PagerDuty sees one incident, and a finished upgrade resolves whichever notice is current
 	if key != cc.upgradeKey {
-		if cc.upgradeAlarms[0] != "" {
-			td.alert(cc.name, cc.upgradeAlarms[0], "info", true, cc.alertId("upgrade"))
+		for i := len(cc.upgradeAlarms) - 1; i >= 0; i-- {
+			if cc.upgradeAlarms[i] != "" {
+				td.alert(cc.name, cc.upgradeAlarms[i], "info", true, cc.alertId("upgrade"))
+				break
+			}
 		}
-		alarms.forget(cc.name, cc.upgradeAlarms[1], cc.upgradeAlarms[2])
+		alarms.forget(cc.name, cc.upgradeAlarms[:]...)
 		cc.upgradeAlarms = [3]string{}
 		cc.upgradeKey = key
 	}
@@ -337,6 +347,7 @@ func (cc *ChainConfig) alertUpgrade() {
 		if s.due && cc.upgradeAlarms[i] == "" {
 			cc.upgradeAlarms[i] = s.msg
 			td.alert(cc.name, s.msg, s.severity, false, cc.alertId("upgrade"))
+			alarms.forget(cc.name, cc.upgradeAlarms[:i]...)
 			return
 		}
 	}
@@ -378,18 +389,22 @@ func (cc *ChainConfig) alertGov() {
 		if a.finalMsg == "" && final {
 			a.finalMsg = fmt.Sprintf("%s #%d (%s) on %s closes in under %d hours (%s) and %s has still not voted", kind, p.ID, p.Title, cc.ChainId, cc.Alerts.GovFinalHours, ends, cc.valInfo.Moniker)
 			td.alert(cc.name, a.finalMsg, cc.Alerts.GovPriority, false, &id)
+			// the final notice takes over from the open one on the dashboard
+			alarms.forget(cc.name, a.msg)
 		}
 	}
 	for pid, a := range cc.govAlarms {
 		if open[pid] {
 			continue
 		}
+		// one resolve, for whichever notice is current
 		id := *cc.alertId(fmt.Sprintf("gov%d", pid))
-		if a.msg != "" {
-			td.alert(cc.name, a.msg, "info", true, &id)
-		}
-		if a.finalMsg != "" {
+		switch {
+		case a.finalMsg != "":
 			td.alert(cc.name, a.finalMsg, "info", true, &id)
+			alarms.forget(cc.name, a.msg)
+		case a.msg != "":
+			td.alert(cc.name, a.msg, "info", true, &id)
 		}
 		delete(cc.govAlarms, pid)
 	}

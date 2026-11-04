@@ -704,8 +704,19 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		}
 		if saved.Alarms.AllAlarms != nil {
 			alarms.AllAlarms = saved.Alarms.AllAlarms
-			for _, alrm := range saved.Alarms.AllAlarms {
+			for name, alrm := range saved.Alarms.AllAlarms {
 				clearStale(alrm, "dashboard", c.Pagerduty.Enabled, staleHours)
+				// an alarm the chain can no longer produce would never resolve: the chain left the config, or it
+				// is RPC-only now and the alarm is about its former validator
+				cc := c.Chains[name]
+				for msg := range alrm {
+					_, kind := alertKind(msg)
+					validatorOnly := kind == "Governance" || kind == "Voting power" || kind == "Missed blocks" || kind == "Validator inactive"
+					if cc == nil || (cc.rpcOnly() && validatorOnly) {
+						l(fmt.Sprintf("🗑 dropping restored alarm that %s can no longer resolve - %s", name, msg))
+						delete(alrm, msg)
+					}
+				}
 			}
 		}
 	}

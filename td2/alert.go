@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -412,8 +413,26 @@ func listAlarms(chain string) []dash.AlertStatus {
 	for msg, since := range alarms.AllAlarms[chain] {
 		out = append(out, dash.AlertStatus{Message: msg, Since: since.Unix()})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Since < out[j].Since })
+	// alarms that carry a deadline (governance notices) sort by it, soonest first, after the operational ones;
+	// the rest by age, then text, so the list holds still between updates
+	sort.SliceStable(out, func(i, j int) bool {
+		di, dj := deadline(out[i].Message), deadline(out[j].Message)
+		if di != dj {
+			return di < dj
+		}
+		if out[i].Since != out[j].Since {
+			return out[i].Since < out[j].Since
+		}
+		return out[i].Message < out[j].Message
+	})
 	return out
+}
+
+var deadlineRex = regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC`)
+
+// deadline is the "YYYY-MM-DD HH:MM UTC" an alarm text names, or empty when it names none.
+func deadline(msg string) string {
+	return deadlineRex.FindString(msg)
 }
 
 // alert creates a universal alert and pushes it to the alertChan to be delivered to appropriate services

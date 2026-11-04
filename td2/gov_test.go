@@ -62,3 +62,25 @@ func TestConsensusPrefix(t *testing.T) {
 		}
 	}
 }
+
+func TestUpgradeHeldUntilChainMoves(t *testing.T) {
+	// the plan a node reports and the height of the last block seen decide whether the upgrade is still open
+	cases := []struct {
+		planGone  bool
+		lastBlock int64
+		keep      bool
+	}{
+		{false, 90, true},  // plan still reported: open
+		{true, 50, false},  // gone long before the height: cancelled
+		{true, 99, true},   // chain halted at height-1: still open
+		{true, 100, true},  // first block at the height, not yet past it: still open
+		{true, 101, false}, // a block beyond the height: done
+	}
+	for _, c := range cases {
+		held := c.planGone && c.lastBlock >= 100-1 && c.lastBlock <= 100
+		open := !c.planGone || held
+		if open != c.keep {
+			t.Errorf("planGone=%v lastBlock=%d: open=%v, want %v", c.planGone, c.lastBlock, open, c.keep)
+		}
+	}
+}

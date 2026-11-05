@@ -646,7 +646,7 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		// authentic is not the same as current: refuse a config older than one already accepted
 		if c.ConfigVersion > 0 {
 			prev := &savedState{}
-			if sb, e := os.ReadFile(stateFile); e == nil {
+			if sb, e := os.ReadFile(stateFile); e == nil { // #nosec G304 -- the state path is a command line flag
 				_ = json.Unmarshal(sb, prev)
 			}
 			if c.ConfigVersion < prev.ConfigVersion {

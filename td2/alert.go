@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"sort"
 	"strconv"
@@ -65,13 +66,40 @@ type alarmCache struct {
 }
 
 func (a *alarmCache) getCount(chain string) int {
-	if a.AllAlarms == nil || a.AllAlarms[chain] == nil {
-		return 0
-	}
 	a.notifyMux.RLock()
 	defer a.notifyMux.RUnlock()
-	return len(a.AllAlarms[chain])
+	return len(a.AllAlarms[chain]) // len of a nil map is 0
 }
+
+// dedupKey scopes the sent-alarm maps to one chain, so the same text on two chains (the jailed alert for a moniker
+// used on both, or a stalled chain watched by two entries) never satisfies or clears the other's alarm.
+func dedupKey(msg *alertMsg) string { return msg.chain + "\x00" + msg.message }
+
+// notifyClient is shared by the chat webhooks; a stalled endpoint gives up after 30s instead of holding a goroutine.
+var notifyClient = &http.Client{Timeout: 30 * time.Second}
+
+// sendErr strips the request URL from a transport error, since for a webhook or bot the URL is the secret, and
+// blanks any other secret named. Logs reach the dashboard feed, so this runs before every log of a send failure.
+func sendErr(err error, secrets ...string) error {
+	if err == nil {
+		return nil
+	}
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		err = fmt.Errorf("%s: %w", ue.Op, ue.Err)
+	}
+	s := err.Error()
+	for _, sec := range secrets {
+		if sec != "" {
+			s = strings.ReplaceAll(s, sec, "***")
+		}
+	}
+	return errors.New(s)
+}
+
+// discordEsc and slackEsc neutralise the markup each service parses in text a node or a chain account chose.
+var discordEsc = strings.NewReplacer("\\", "\\\\", "*", "\\*", "_", "\\_", "~", "\\~", "`", "\\`", "|", "\\|", "[", "\\[", "]", "\\]", "<", "\\<", ">", "\\>", "@", "@\u200b")
+var slackEsc = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
 // alarms is used to prevent double notifications. TODO: save on exit / load on start
 var alarms = &alarmCache{
@@ -107,13 +135,14 @@ func shouldNotify(msg *alertMsg, dest notifyDest) bool {
 		service = "Slack"
 	}
 
+	key := dedupKey(msg)
 	switch {
-	case !whichMap[msg.message].IsZero() && !msg.resolved:
+	case !whichMap[key].IsZero() && !msg.resolved:
 		// already sent this alert
 		return false
-	case !whichMap[msg.message].IsZero() && msg.resolved:
+	case !whichMap[key].IsZero() && msg.resolved:
 		// alarm is cleared
-		delete(whichMap, msg.message)
+		delete(whichMap, key)
 		l(fmt.Sprintf("💜 Resolved     alarm on %s (%s) - notifying %s", msg.chain, msg.message, service))
 		return true
 	case msg.resolved:
@@ -136,7 +165,7 @@ func shouldNotify(msg *alertMsg, dest notifyDest) bool {
 	}
 
 	l(fmt.Sprintf("🚨 ALERT        new alarm on %s (%s) - notifying %s", msg.chain, msg.message, service))
-	whichMap[msg.message] = time.Now()
+	whichMap[key] = time.Now()
 	return true
 }
 
@@ -157,10 +186,9 @@ func notifySlack(msg *alertMsg) (err error) {
 		return
 	}
 
-	client := &http.Client{}
-	resp, err := client.Do(req)
+	resp, err := notifyClient.Do(req)
 	if err != nil {
-		return
+		return sendErr(err)
 	}
 	_ = resp.Body.Close()
 
@@ -190,7 +218,7 @@ func buildSlackMessage(msg *alertMsg) *SlackMessage {
 		Attachments: []Attachment{
 			{
 				Title: alertHeading(msg),
-				Text:  alertBody(msg) + "\n" + msg.chainId,
+				Text:  slackEsc.Replace(alertBody(msg)) + "\n" + msg.chainId,
 				Color: color,
 			},
 		},
@@ -205,7 +233,6 @@ func notifyDiscord(msg *alertMsg) (err error) {
 		return nil
 	}
 	discPost := buildDiscordMessage(msg)
-	client := &http.Client{}
 	data, err := json.MarshalIndent(discPost, "", "  ")
 	if err != nil {
 		l("⚠️ Could not notify discord!", err)
@@ -221,8 +248,9 @@ func notifyDiscord(msg *alertMsg) (err error) {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/json")
-		resp, err := client.Do(req)
+		resp, err := notifyClient.Do(req)
 		if err != nil {
+			err = sendErr(err)
 			l("⚠️ Could not notify discord!", err)
 			return err
 		}
@@ -341,7 +369,7 @@ func buildDiscordMessage(msg *alertMsg) *DiscordMessage {
 		Content:  msg.discMentions,
 		Embeds: []DiscordEmbed{{
 			Title:       alertHeading(msg),
-			Description: alertBody(msg),
+			Description: discordEsc.Replace(alertBody(msg)),
 			Color:       color,
 			Fields:      fields,
 			Timestamp:   time.Now().UTC().Format(time.RFC3339),
@@ -356,8 +384,9 @@ func notifyTg(msg *alertMsg) (err error) {
 	if !shouldNotify(msg, tg) {
 		return nil
 	}
-	bot, err := tgbotapi.NewBotAPI(msg.tgKey)
+	bot, err := tgbotapi.NewBotAPIWithClient(msg.tgKey, tgbotapi.APIEndpoint, notifyClient)
 	if err != nil {
+		err = sendErr(err, msg.tgKey)
 		l("notify telegram:", err)
 		return
 	}
@@ -369,6 +398,7 @@ func notifyTg(msg *alertMsg) (err error) {
 	mc := tgbotapi.NewMessageToChannel(msg.tgChannel, text)
 	_, err = bot.Send(mc)
 	if err != nil {
+		err = sendErr(err, msg.tgKey)
 		l("telegram send:", err)
 	}
 	return err
@@ -594,7 +624,7 @@ func (cc *ChainConfig) watch() {
 			cc.lastBlockTime.Before(time.Now().Add(time.Duration(-cc.Alerts.Stalled)*time.Minute))
 		if cc.Alerts.StalledAlerts && stalled != cc.lastBlockAlarm {
 			cc.lastBlockAlarm = stalled
-			severity := "critical"
+			severity := cc.Alerts.StalledPriority
 			if stalled {
 				cc.stalledMsg = fmt.Sprintf("stalled: have not seen a new block on %s in %d minutes", cc.ChainId, cc.Alerts.Stalled)
 				if cc.upgrade != nil && cc.upgrade.Height-cc.lastBlockNum <= 1 && cc.upgrade.Height >= cc.lastBlockNum {
@@ -619,7 +649,7 @@ func (cc *ChainConfig) watch() {
 				}
 				td.alert(
 					cc.name,
-					fmt.Sprintf("%s is no longer active: validator is %s", cc.valInfo.Moniker, inactive),
+					fmt.Sprintf("%s is no longer active on %s: validator is %s", cc.valInfo.Moniker, cc.ChainId, inactive),
 					"critical",
 					false,
 					&id,
@@ -627,7 +657,7 @@ func (cc *ChainConfig) watch() {
 			} else if cc.valInfo.Bonded && !cc.lastValInfo.Bonded {
 				td.alert(
 					cc.name,
-					fmt.Sprintf("%s is no longer active: validator is %s", cc.valInfo.Moniker, inactive),
+					fmt.Sprintf("%s is no longer active on %s: validator is %s", cc.valInfo.Moniker, cc.ChainId, inactive),
 					"info",
 					true,
 					&id,

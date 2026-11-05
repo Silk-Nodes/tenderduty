@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -27,7 +28,13 @@ import (
 const (
 	showBLocks = 512
 	staleHours = 24
+	// configMaxBytes caps a remote configuration download.
+	configMaxBytes = 4 << 20
 )
+
+// severities are the PagerDuty Events v2 values; anything else is refused at startup because PagerDuty would
+// reject the event and the page would be lost silently.
+var severities = map[string]bool{"info": true, "warning": true, "error": true, "critical": true}
 
 // Config holds both the settings for tenderduty to monitor and state information while running.
 type Config struct {
@@ -39,10 +46,18 @@ type Config struct {
 	cancel     context.CancelFunc
 	alarms     *alarmCache
 
+	// ConfigVersion, when set, must not go backwards between restarts of a remotely loaded config. Without it any
+	// configuration ever encrypted with the password stays valid, so whoever serves the file could serve an old one.
+	ConfigVersion int64 `yaml:"config_version"`
+
 	// EnableDash enables the web dashboard
 	EnableDash bool `yaml:"enable_dashboard"`
-	// Listen is the URL for the dashboard to listen on, must be a valid/parsable URL
+	// Listen is the TCP port for the dashboard
 	Listen string `yaml:"listen_port"`
+	// ListenAddress is the interface the dashboard and the prometheus exporter bind to. Empty means every interface.
+	// Neither has any authentication, so a dashboard that is not meant for the whole network belongs on 127.0.0.1
+	// or a private address, with a reverse proxy in front if it has to be reached from further away.
+	ListenAddress string `yaml:"listen_address"`
 	// HideLogs controls whether logs are sent to the dashboard. It will also suppress many alarm details.
 	// This is useful if the dashboard will be public.
 	HideLogs bool `yaml:"hide_logs"`
@@ -79,9 +94,10 @@ type Config struct {
 // savedState is dumped to a JSON file at exit time, and is loaded at start. If successful it will prevent
 // duplicate alerts, and will show old blocks in the dashboard.
 type savedState struct {
-	Alarms    *alarmCache                     `json:"alarms"`
-	Blocks    map[string][]int                `json:"blocks"`
-	NodesDown map[string]map[string]time.Time `json:"nodes_down"`
+	Alarms        *alarmCache                     `json:"alarms"`
+	Blocks        map[string][]int                `json:"blocks"`
+	NodesDown     map[string]map[string]time.Time `json:"nodes_down"`
+	ConfigVersion int64                           `json:"config_version,omitempty"`
 }
 
 // ChainConfig represents a validator to be monitored on a chain, it is somewhat of a misnomer since multiple
@@ -252,6 +268,9 @@ type AlertConfig struct {
 	ConsecutiveMissed int `yaml:"consecutive_missed"`
 	// Tag for pagerduty to set the alert priority
 	ConsecutivePriority string `yaml:"consecutive_priority"`
+	// StalledPriority is the severity of the stalled chain alert, critical unless set. Lower it to info on a chain
+	// whose nodes go down for planned maintenance, so the notice reaches chat without paging.
+	StalledPriority string `yaml:"stalled_priority"`
 	// Whether to alert on consecutive missed blocks
 	ConsecutiveAlerts bool `yaml:"consecutive_enabled"`
 
@@ -379,6 +398,10 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 			problems = append(problems, fmt.Sprintf("error: The listen URL %s does not appear to be valid", c.Listen))
 		}
 	}
+	if c.ListenAddress != "" && net.ParseIP(c.ListenAddress) == nil {
+		fatal = true
+		problems = append(problems, fmt.Sprintf("error: listen_address %s is not an IP address", c.ListenAddress))
+	}
 
 	if c.Pagerduty.Enabled {
 		rex := regexp.MustCompile(`[+_-]`)
@@ -388,6 +411,10 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		}
 	}
 
+	if c.NodeDownSeverity != "" && !severities[c.NodeDownSeverity] {
+		fatal = true
+		problems = append(problems, fmt.Sprintf("error: node_down_alert_severity %q is not one of info, warning, error, critical", c.NodeDownSeverity))
+	}
 	if c.NodeDownSeverity == "" {
 		c.NodeDownSeverity = "critical"
 	}
@@ -439,6 +466,9 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		setDefault(&v.Alerts.UpgradeNoticeHours, 24)
 		setDefault(&v.Alerts.UpgradeImminentMinutes, 60)
 		setDefault(&v.Alerts.GovFinalHours, 24)
+		if v.Alerts.StalledPriority == "" {
+			v.Alerts.StalledPriority = "critical"
+		}
 		if v.Alerts.VotingPowerChangePercent <= 0 {
 			v.Alerts.VotingPowerChangePercent = 10
 		}
@@ -451,6 +481,16 @@ func validateConfig(c *Config) (fatal bool, problems []string) {
 		}
 		if v.Alerts.VotingPowerPriority == "" {
 			v.Alerts.VotingPowerPriority = "info"
+		}
+		for name, sev := range map[string]string{
+			"consecutive_priority": v.Alerts.ConsecutivePriority, "percentage_priority": v.Alerts.PercentagePriority,
+			"stalled_priority": v.Alerts.StalledPriority, "upgrade_priority": v.Alerts.UpgradePriority,
+			"governance_priority": v.Alerts.GovPriority, "voting_power_priority": v.Alerts.VotingPowerPriority,
+		} {
+			if sev != "" && !severities[sev] {
+				fatal = true
+				problems = append(problems, fmt.Sprintf("error: %s %s %q is not one of info, warning, error, critical", k, name, sev))
+			}
 		}
 
 		// the bools for enabling alerts are deprecated with full configs preferred,
@@ -573,27 +613,45 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		if *password == "" {
 			return nil, errors.New("a password is required if loading a remote configuration")
 		}
+		if !strings.HasPrefix(yamlFile, "https://") {
+			return nil, errors.New("a remote configuration must be loaded over https")
+		}
+		client := &http.Client{Timeout: 30 * time.Second}
 		//#nosec -- url is specified on command line
-		resp, err := http.Get(yamlFile)
+		resp, err := client.Get(yamlFile)
 		if err != nil {
 			return nil, err
 		}
-		b, err := io.ReadAll(resp.Body)
-		if err != nil {
-			return nil, err
-		}
+		b, err := io.ReadAll(io.LimitReader(resp.Body, configMaxBytes))
 		_ = resp.Body.Close()
-		log.Printf("downloaded %d bytes from %s", len(b), yamlFile)
+		if err != nil {
+			return nil, err
+		}
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("remote configuration returned %d", resp.StatusCode)
+		}
+		if u, e := url.Parse(yamlFile); e == nil {
+			log.Printf("downloaded %d bytes from %s", len(b), u.Redacted())
+		}
 		decrypted, err := decrypt(b, *password)
 		if err != nil {
 			return nil, err
 		}
-		empty := ""
-		password = &empty             // let gc get password out of memory, it's still referenced in main()
-		_ = os.Setenv("PASSWORD", "") // also clear the ENV var
+		*password = ""              // the caller's copy, not a local one; the string in main() is what lingered
+		_ = os.Unsetenv("PASSWORD") // and the environment variable
 		err = yaml.Unmarshal(decrypted, c)
 		if err != nil {
 			return nil, err
+		}
+		// authentic is not the same as current: refuse a config older than one already accepted
+		if c.ConfigVersion > 0 {
+			prev := &savedState{}
+			if sb, e := os.ReadFile(stateFile); e == nil { // #nosec G304 -- the state path is a command line flag
+				_ = json.Unmarshal(sb, prev)
+			}
+			if c.ConfigVersion < prev.ConfigVersion {
+				return nil, fmt.Errorf("remote configuration version %d is older than the accepted version %d", c.ConfigVersion, prev.ConfigVersion)
+			}
 		}
 	} else {
 		//#nosec -- variable specified on command line
@@ -758,7 +816,7 @@ func clearStale(alarms map[string]time.Time, what string, hasPagerduty bool, hou
 	for k := range alarms {
 		if time.Since(alarms[k]).Hours() >= hours {
 			l(fmt.Sprintf("🗑 not restoring old alarm (%v >%.2f hours) from cache - %s", alarms[k], hours, k))
-			if hasPagerduty && what == "pagerduty" {
+			if hasPagerduty && what == "PagerDuty" {
 				l("NOTE: stale alarms may need to be manually cleared from PagerDuty!")
 			}
 			delete(alarms, k)
@@ -766,4 +824,9 @@ func clearStale(alarms map[string]time.Time, what string, hasPagerduty bool, hou
 		}
 		l(fmt.Sprintf("📂 restored %s alarm state - %s", what, k))
 	}
+}
+
+// listenAddr is where the dashboard listens; an empty listen_address means every interface.
+func (c *Config) listenAddr() string {
+	return net.JoinHostPort(c.ListenAddress, c.Listen)
 }

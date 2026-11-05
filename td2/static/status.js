@@ -154,7 +154,7 @@ function nodesCell(c) {
     ).join("; ")
     const cls = c.healthy_nodes < c.nodes ? "warn" : ""
     const icon = c.healthy_nodes < c.nodes ? `<span uk-icon="icon: arrow-down; ratio: 0.8"></span> ` : ""
-    return `<span class="${cls}" uk-tooltip="${esc(tip)}">${icon}${esc(c.healthy_nodes)} / ${esc(c.nodes)}</span>`
+    return `<span class="${cls}" title="${esc(tip)}">${icon}${esc(c.healthy_nodes)} / ${esc(c.nodes)}</span>`
 }
 
 // nodeLink turns an RPC URL into a link so a dead node can be checked in a new tab.
@@ -183,7 +183,7 @@ function detailPanel(c) {
     html += `<table class="uk-table uk-table-small"><tr class="muted"><th>node</th><th>state</th><th>height</th><th>lag</th><th>note</th></tr>`
     for (const n of (c.node_status || [])) {
         const state = n.up ? `<span class="ok">up</span>` : (n.syncing ? `<span class="warn">syncing</span>` : `<span class="bad">down</span>`)
-        html += `<tr><td class="mono">${nodeLink(n.name)}${n.active ? ' <span class="muted">(in use)</span>' : ""}</td><td>${state}</td><td class="mono">${n.height ? num(n.height) : ""}</td><td class="mono">${n.lag || ""}</td><td class="muted note" uk-tooltip="${esc(n.message || "")}">${esc(n.message || "")}</td></tr>`
+        html += `<tr><td class="mono">${nodeLink(n.name)}${n.active ? ' <span class="muted">(in use)</span>' : ""}</td><td>${state}</td><td class="mono">${n.height ? num(n.height) : ""}</td><td class="mono">${n.lag || ""}</td><td class="muted note" title="${esc(n.message || "")}">${esc(n.message || "")}</td></tr>`
     }
     html += `</table>`
     if ((c.proposals || []).length > 0) {

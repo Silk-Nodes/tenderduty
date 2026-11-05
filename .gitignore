@@ -4,6 +4,8 @@ config.yml.asc
 *-config.yml
 !example-config.yml
 docker-compose.yml
+# per-chain files can carry webhooks and keys too
+chains.d/
 .tenderduty-state.json
 tenderduty-*
 tenderduty

@@ -1,6 +1,6 @@
 # Loading Remote Configurations
 
-It is possible to load a configuration file over HTTP/HTTPS. This is useful for remote/containerized servers where it is possible to safely pass in a decryption secret via environment variables. This requires first encrypting the file with a password. **Tenderduty will refuse to remotely load a plaintext configuration**.
+It is possible to load a configuration file over HTTPS. This is useful for remote/containerized servers where it is possible to safely pass in a decryption secret via environment variables. This requires first encrypting the file with a password. **Tenderduty will refuse to remotely load a plaintext configuration**.
 
 *Note: Tenderduty does not currently poll the remote config file for changes, and will need to be manually restarted to pick up changes if the file is modified.*
 
@@ -32,6 +32,6 @@ Please enter the encryption password:
 
 ## Using a Remotely Hosted Config File
 
-At startup, tenderduty will check the prefix of the config file setting, and if it begins with `http://` or `https://` it will attempt to retrieve the file from a web server. The config file location can be specified on the command line using the `-f` flag, or by setting the `CONFIG` environment variable.
+At startup, tenderduty will check the prefix of the config file setting, and if it begins with `https://` it will attempt to retrieve the file from a web server. Plain `http://` is refused: the encryption keeps the content private and authentic, but anyone on the path could still replay an older copy. For the same reason the config may carry a `config_version` number; tenderduty remembers the last one it accepted in its state file and refuses a lower one. The config file location can be specified on the command line using the `-f` flag, or by setting the `CONFIG` environment variable.
 
-Tendermint will not attempt to use a remote configuration if a password is not set. This can be done by either supplying the `-password` flag or via the `PASSWORD` environment variable. Using the environment variable is slightly safer because **it is cleared once it has been read**, and other users on a system will be able to see the password by looking at running processes if the `-password` flag is used.
+Tendermint will not attempt to use a remote configuration if a password is not set. This can be done by either supplying the `-password` flag or via the `PASSWORD` environment variable. Use the environment variable. It is cleared once it has been read, whereas a password on the command line stays visible in the process list for as long as tenderduty runs.

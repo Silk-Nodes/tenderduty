@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	rpchttp "github.com/cometbft/cometbft/rpc/client/http"
+	jsonrpcclient "github.com/cometbft/cometbft/rpc/jsonrpc/client"
 )
 
 const (
@@ -21,6 +23,37 @@ const (
 )
 
 var errSyncing = errors.New("not synced")
+
+// rpcMaxBody caps what a node may send back to one RPC call. A status answer is a few KB and the largest ABCI page
+// a few hundred KB; without a cap a node could answer with hundreds of MB and the whole process would buffer it.
+const rpcMaxBody = 8 << 20
+
+// limitedBody is a transport that cuts every response body at rpcMaxBody.
+type limitedBody struct{ http.RoundTripper }
+
+func (t limitedBody) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := t.RoundTripper.RoundTrip(r)
+	if err == nil {
+		resp.Body = struct {
+			io.Reader
+			io.Closer
+		}{io.LimitReader(resp.Body, rpcMaxBody), resp.Body}
+	}
+	return resp, err
+}
+
+// newRpcClient is the CometBFT client with a body cap, an overall timeout and no redirects; the library's default
+// has none of the three.
+func newRpcClient(u string) (*rpchttp.HTTP, error) {
+	hc, err := jsonrpcclient.DefaultHTTPClient(u)
+	if err != nil {
+		return nil, err
+	}
+	hc.Transport = limitedBody{hc.Transport}
+	hc.Timeout = 30 * time.Second
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return rpchttp.NewWithClient(u, "/websocket", hc)
+}
 
 // probeResult is what one node reported when asked for its status.
 type probeResult struct {
@@ -36,7 +69,7 @@ func probe(u, chainID string) (height int64, blockTime time.Time, err error) {
 	if _, err = url.Parse(u); err != nil {
 		return 0, time.Time{}, fmt.Errorf("could not parse url: %w", err)
 	}
-	c, err := rpchttp.New(u, "/websocket")
+	c, err := newRpcClient(u)
 	if err != nil {
 		return 0, time.Time{}, fmt.Errorf("could not create client: %w", err)
 	}
@@ -158,11 +191,19 @@ func (cc *ChainConfig) markUp(node *NodeConfig) {
 
 // useNode points the RPC client at a node.
 func (cc *ChainConfig) useNode(u string) error {
-	c, err := rpchttp.New(u, "/websocket")
+	c, err := newRpcClient(u)
 	if err != nil {
 		return err
 	}
 	cc.clientMux.Lock()
+	if cc.currentUrl != u {
+		// what the previous node said is not evidence about this one: look the operator up again and let the
+		// governance query path start from the current API
+		if strings.Contains(cc.ValAddress, "valcons") {
+			cc.operator = ""
+		}
+		cc.govLegacy = false
+	}
 	cc.client = c
 	cc.currentUrl = u
 	cc.clientMux.Unlock()
@@ -265,13 +306,14 @@ func (c *Config) pingHealthcheck() {
 	client := &http.Client{Timeout: 10 * time.Second}
 	go func() {
 		for range ticker.C {
+			// the ping URL is the healthcheck's secret, so neither the success line nor the error may carry it
 			resp, err := client.Get(c.Healthcheck.PingURL)
 			if err != nil {
-				l(fmt.Sprintf("❌ Failed to ping healthcheck URL: %s", err.Error()))
+				l("❌ Failed to ping healthcheck URL:", sendErr(err))
 				continue
 			}
 			_ = resp.Body.Close()
-			l(fmt.Sprintf("🏓 Successfully pinged healthcheck URL: %s", c.Healthcheck.PingURL))
+			l("🏓 Successfully pinged healthcheck URL")
 		}
 	}()
 }
@@ -282,27 +324,29 @@ var endpointRex = regexp.MustCompile(`//([^/:]+)(:\d+)?`)
 // guessPublicEndpoint attempts to deal with a shortcoming in the tendermint RPC client that doesn't allow path prefixes.
 // The cosmos.directory requires them. This is a workaround to get the actual URL for the server behind their proxy.
 // The RPC base URL will return links endpoints, and we can parse this to guess the original URL.
+// The page is a third party's: the fetch is bounded, the result is always https (a port other than 443 used to
+// mean plain http, which handed an on-path party the node's position) and the choice is logged.
 func guessPublicEndpoint(u string) string {
-	resp, err := http.Get(u + "/")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(u + "/")
 	if err != nil {
 		return u
 	}
-	b, err := io.ReadAll(resp.Body)
+	defer resp.Body.Close()
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
 	if err != nil {
 		return u
 	}
-	_ = resp.Body.Close()
 	matches := endpointRex.FindStringSubmatch(string(b))
 	if len(matches) < 2 {
 		// didn't work
 		return u
 	}
-	proto := "https://"
 	port := ":443"
-	// will be 3 elements if there is a port no port means listening on https
-	if len(matches) == 3 && matches[2] != "" && matches[2] != ":443" {
-		proto = "http://"
+	if len(matches) == 3 && matches[2] != "" {
 		port = matches[2]
 	}
-	return proto + matches[1] + port
+	guess := "https://" + matches[1] + port
+	l("⛑ public proxy page names", guess)
+	return guess
 }

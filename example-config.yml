@@ -1,8 +1,12 @@
 ---
 # controls whether the dashboard is enabled.
 enable_dashboard: yes
-# What TCP port the dashboard will listen on. Only the port is controllable for now.
+# What TCP port the dashboard will listen on.
 listen_port: 8888
+# Which address the dashboard and the prometheus exporter bind to. Neither has any authentication, so unless the
+# whole network may read node addresses, alerts and logs, bind to 127.0.0.1 (or a private address) and put a
+# reverse proxy with its own access control in front. Empty means every interface, which docker needs.
+listen_address: ""
 # hide_logs is useful if the dashboard will be posted publicly. It disables the log feed,
 # and obscures most node-related details. Be aware this isn't fully vetted for preventing
 # info leaks about node names, etc.
@@ -16,7 +20,7 @@ lag_blocks: 10
 
 # Should the prometheus exporter be enabled?
 prometheus_enabled: yes
-# What port should it listen on? For now only port is configurable.
+# What port should it listen on? It binds to listen_address, like the dashboard.
 prometheus_listen_port: 28686
 
 # Global setting for pagerduty
@@ -90,6 +94,8 @@ chains:
       stalled_enabled: yes
       # How long a halted chain takes in minutes to generate an alarm
       stalled_minutes: 10
+      # Severity of the stalled alert. Default critical; info keeps it off PagerDuty on a chain with planned downtime
+      stalled_priority: critical
 
       # Most basic alarm, you just missed x blocks ... would you like to know?
       consecutive_enabled: yes

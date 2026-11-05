@@ -1,5 +1,7 @@
 ---
 name: Gosec
+permissions:
+  contents: read
 on:
   push:
     branches:
@@ -17,7 +19,9 @@ jobs:
     steps:
       - name: Checkout Source
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Run Gosec Security Scanner
-        uses: securego/gosec@master
+        uses: securego/gosec@5eb1d104ef85ff2c905c877eb600e8c1dee33a22 # v2.30.0
         with:
           args: ./...

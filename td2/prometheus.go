@@ -7,7 +7,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"log"
+	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -67,7 +69,13 @@ func (m metrics) setStat(update *promUpdate) {
 	if update.metric == metricNodeLagSeconds || update.metric == metricNodeDownSeconds {
 		lbls["endpoint"] = update.endpoint
 	}
-	m[update.metric].With(lbls).Set(update.counter)
+	// GetMetricWith returns an error for a label a node made up (invalid UTF-8) where With would panic
+	g, err := m[update.metric].GetMetricWith(lbls)
+	if err != nil {
+		l(fmt.Sprintf("prometheus: dropping update for %s: %v", update.chainId, err))
+		return
+	}
+	g.Set(update.counter)
 }
 
 func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
@@ -175,7 +183,7 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 		metricVotingPowerPercent:       votingPowerPercent,
 	}
 
-	go func() {
+	go guard("prometheus exporter", func() {
 		for {
 			select {
 			case u := <-updates:
@@ -184,14 +192,15 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 				return
 			}
 		}
-	}()
+	})
 
 	promMux := http.NewServeMux()
 
-	l(fmt.Sprintf("serving prometheus metrics at 0.0.0.0:%d/metrics", td.PrometheusListenPort))
+	addr := net.JoinHostPort(td.ListenAddress, strconv.Itoa(td.PrometheusListenPort))
+	l(fmt.Sprintf("serving prometheus metrics at %s/metrics", addr))
 	promMux.Handle("/metrics", promhttp.Handler())
 	promSrv := &http.Server{
-		Addr:              fmt.Sprintf(":%d", td.PrometheusListenPort),
+		Addr:              addr,
 		Handler:           promMux,
 		ReadTimeout:       20 * time.Second,
 		WriteTimeout:      20 * time.Second,

@@ -194,6 +194,7 @@ func (cc *ChainConfig) WsRun() {
 		var msg []byte
 		var e error
 		for {
+			_ = ws.SetReadDeadline(time.Now().Add(2 * time.Minute))
 			_, msg, e = ws.ReadMessage()
 			if e != nil {
 				l(e)
@@ -205,11 +206,20 @@ func (cc *ChainConfig) WsRun() {
 			if e != nil {
 				continue
 			}
+			// every send watches ctx: once the consumer has gone a plain send would park this goroutine for good
 			switch reply.Type() {
 			case `tendermint/event/NewBlock`:
-				blockChan <- reply
+				select {
+				case blockChan <- reply:
+				case <-ctx.Done():
+					return
+				}
 			case `tendermint/event/Vote`:
-				voteChan <- reply
+				select {
+				case voteChan <- reply:
+				case <-ctx.Done():
+					return
+				}
 			default:
 				// fmt.Println("unknown response", reply.Type())
 			}
@@ -310,7 +320,11 @@ func handleBlocks(ctx context.Context, blocks chan *WsReply, results chan Status
 			} else if b.find(address) {
 				upd.Status = StatusSigned
 			}
-			results <- upd
+			select {
+			case results <- upd:
+			case <-ctx.Done():
+				return nil
+			}
 		case <-ctx.Done():
 			return nil
 		}
@@ -349,7 +363,11 @@ func handleVotes(ctx context.Context, votes chan *WsReply, results chan StatusUp
 				case "SIGNED_MSG_TYPE_PROPOSAL":
 					upd.Status = StatusProposed
 				}
-				results <- upd
+				select {
+				case results <- upd:
+				case <-ctx.Done():
+					return
+				}
 			}
 
 		case <-ctx.Done():
@@ -360,6 +378,8 @@ func handleVotes(ctx context.Context, votes chan *WsReply, results chan StatusUp
 
 // newWsClient dials the websocket endpoint of an RPC node. Public nodes sometimes serve RPC under a path prefix,
 // so the /websocket suffix is only added when missing.
+const wsMaxMessage = 16 << 20
+
 func newWsClient(u string) (*websocket.Conn, error) {
 	u = strings.TrimRight(u, "/")
 	if !strings.HasSuffix(u, "/websocket") {
@@ -381,5 +401,8 @@ func newWsClient(u string) (*websocket.Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not dial websocket %s: %w", endpoint.String(), err)
 	}
+	// a block event with every signature is well under 1 MB; a frame past this closes the socket instead of
+	// being buffered whole
+	conn.SetReadLimit(wsMaxMessage)
 	return conn, nil
 }

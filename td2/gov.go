@@ -97,6 +97,9 @@ func (cc *ChainConfig) refreshUpgrade(ctx context.Context) error {
 	if resp.Plan == nil && cc.upgrade != nil && cc.lastBlockNum >= cc.upgrade.Height-1 && cc.lastBlockNum <= cc.upgrade.Height {
 		return nil
 	}
+	if resp.Plan != nil {
+		resp.Plan.Name = clean(resp.Plan.Name, 70)
+	}
 	cc.upgrade = resp.Plan
 	return nil
 }

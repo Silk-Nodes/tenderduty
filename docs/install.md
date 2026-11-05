@@ -109,6 +109,8 @@ docker run -d --name tenderduty -p "8888:8888" -p "28686:28686" --restart unless
 docker logs -f --tail 20 tenderduty
 ```
 
+The dashboard and the metrics endpoint have no authentication. Publish them on the loopback address, `-p "127.0.0.1:8888:8888"`, unless everything on the network may read node addresses, alerts and logs, and put a reverse proxy with its own access control in front for anything further away. The binary install has the same choice through `listen_address` in the config.
+
 ## Docker Compose
 
 ```shell

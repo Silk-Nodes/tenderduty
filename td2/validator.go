@@ -164,23 +164,52 @@ func (cc *ChainConfig) GetValInfo(first bool) (err error) {
 		td.statsChan <- cc.mkUpdate(metricWindowMissed, float64(cc.valInfo.Missed), "")
 	}
 
-	// finally get the signed blocks window
-	if cc.valInfo.Window == 0 {
-		params := &slashing.QueryParamsResponse{}
-		err = abciQuery(ctx, cc.client, "/cosmos.slashing.v1beta1.Query/Params", &slashing.QueryParamsRequest{}, params)
-		if err != nil {
+	// finally the signed blocks window. It is asked for on every refresh so a value learned from one node does not
+	// outlive that node; a bad answer keeps the previous window rather than clearing it, since watch divides by it.
+	params := &slashing.QueryParamsResponse{}
+	err = abciQuery(ctx, cc.client, "/cosmos.slashing.v1beta1.Query/Params", &slashing.QueryParamsRequest{}, params)
+	if err == nil && params.Params.SignedBlocksWindow <= 0 {
+		err = errors.New("signed_blocks_window is missing")
+	}
+	var minSigned float64
+	if err == nil {
+		if params.Params.MinSignedPerWindow.IsNil() {
+			err = errors.New("min_signed_per_window is missing")
+		} else {
+			minSigned, err = params.Params.MinSignedPerWindow.Float64()
+		}
+	}
+	if err != nil {
+		if cc.valInfo.Window == 0 {
 			return fmt.Errorf("🛑 could not query slashing params: %w", err)
 		}
-		if first && td.Prom {
-			td.statsChan <- cc.mkUpdate(metricWindowSize, float64(params.Params.SignedBlocksWindow), "")
-			td.statsChan <- cc.mkUpdate(metricTotalNodes, float64(len(cc.Nodes)), "")
-		}
-		cc.valInfo.Window = params.Params.SignedBlocksWindow
-		// x/slashing jails once the missed counter passes window - floor(min_signed_per_window * window)
-		minSigned := params.Params.MinSignedPerWindow.MustFloat64()
-		cc.valInfo.JailAfter = cc.valInfo.Window - int64(minSigned*float64(cc.valInfo.Window))
+		l("❓ keeping the previous slashing window for", cc.ChainId, err)
+		return nil
 	}
-	return
+	if first && td.Prom {
+		td.statsChan <- cc.mkUpdate(metricWindowSize, float64(params.Params.SignedBlocksWindow), "")
+		td.statsChan <- cc.mkUpdate(metricTotalNodes, float64(len(cc.Nodes)), "")
+	}
+	cc.valInfo.Window = params.Params.SignedBlocksWindow
+	// x/slashing jails once the missed counter passes window - floor(min_signed_per_window * window)
+	cc.valInfo.JailAfter = cc.valInfo.Window - int64(minSigned*float64(cc.valInfo.Window))
+	return nil
+}
+
+// clean makes a node-reported string safe to log, label and display: valid UTF-8, no control characters, at most
+// max runes. The SDK caps a moniker at 70 characters, so anything longer did not come from a well-behaved chain.
+func clean(s string, max int) string {
+	s = strings.ToValidUTF8(s, "\uFFFD")
+	s = strings.Map(func(r rune) rune {
+		if r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, s)
+	if r := []rune(s); len(r) > max {
+		return string(r[:max])
+	}
+	return s
 }
 
 // getVal returns the public key, moniker, status flags and delegated stake of a validator.
@@ -207,22 +236,32 @@ func getVal(ctx context.Context, client *rpchttp.HTTP, valoper string) (pub []by
 		return nil, "", false, false, 0, fmt.Errorf("could not get pubkey for %s: %w", valoper, err)
 	}
 
-	return pubBytes, val.Validator.GetMoniker(), val.Validator.Jailed, val.Validator.Status == 3, toFloat(val.Validator.Tokens), nil
+	return pubBytes, clean(val.Validator.GetMoniker(), 70), val.Validator.Jailed, val.Validator.Status == 3, toFloat(val.Validator.Tokens), nil
 }
 
 // consAddress is the consensus address bytes behind a validator's packed consensus public key.
+// The key bytes come from a node, and the SDK's Address() panics on a wrong length, so the length is checked first.
 func consAddress(key *codectypes.Any) ([]byte, error) {
+	if key == nil {
+		return nil, errors.New("missing consensus pubkey")
+	}
 	switch key.TypeUrl {
 	case "/cosmos.crypto.ed25519.PubKey":
 		pk := ed25519.PubKey{}
 		if err := pk.Unmarshal(key.Value); err != nil {
 			return nil, err
 		}
+		if len(pk.Key) != ed25519.PubKeySize {
+			return nil, fmt.Errorf("ed25519 pubkey is %d bytes, want %d", len(pk.Key), ed25519.PubKeySize)
+		}
 		return pk.Address().Bytes(), nil
 	case "/cosmos.crypto.secp256k1.PubKey":
 		pk := secp256k1.PubKey{}
 		if err := pk.Unmarshal(key.Value); err != nil {
 			return nil, err
+		}
+		if len(pk.Key) != secp256k1.PubKeySize {
+			return nil, fmt.Errorf("secp256k1 pubkey is %d bytes, want %d", len(pk.Key), secp256k1.PubKeySize)
 		}
 		return pk.Address().Bytes(), nil
 	}

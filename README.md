@@ -37,6 +37,8 @@ Tenderduty was written by [blockpane](https://github.com/blockpane), and v2 was 
 
 🩹 **Other fixes.** The dashboard feed dropped about half of its updates, so the block grid moved in jumps; it now gets every one-second update and a stale browser tab no longer holds the others up. Slack alerts are de-duplicated like the other channels, a crash when an RPC URL could not be parsed, a healthcheck ping with no timeout, a dashboard that only updated when a block arrived, and a node-down alert whose text began with an empty severity.
 
+🔒 **Hardened after a security audit.** The dashboard serves only its own routes (a dependency used to add `/debug/vars`, which printed the command line), sends no CORS header, accepts websocket connections from its own origin only, and can be bound to one address with `listen_address`. Webhook URLs and bot tokens no longer appear in logs when a send fails. A single bad answer from an RPC node (a short consensus key, a missing slashing parameter, a moniker that is not valid UTF-8, a frame or response of any size) used to end the process for every chain; each of those paths is now checked or bounded, and a panic in one chain's loop restarts that loop instead of the monitor. Alerts are de-duplicated per chain, so a jailing on one chain no longer silences the same alert on another, and chat markup in proposal titles and monikers is escaped.
+
 The new alert types are opt-in per chain: `upgrade_enabled`, `governance_enabled` and `voting_power_enabled` under `alerts`. See [docs/config.md](docs/config.md).
 
 ## Screenshots

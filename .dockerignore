@@ -1,6 +1,15 @@
 .git
 .github
 .idea
-.tenderduty-state.json
 docs
 tenderduty
+tenderduty-*
+# never into a build context: live configs, per-chain overrides and state
+config.yml
+config.yml.asc
+*-config.yml
+!example-config.yml
+chains.d
+docker-compose.yml
+.tenderduty-state.json
+local*

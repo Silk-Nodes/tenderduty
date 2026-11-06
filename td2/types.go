@@ -121,7 +121,8 @@ type ChainConfig struct {
 
 	upgrade       *upgrade.Plan        // scheduled upgrade from x/upgrade, nil when none
 	upgradeKey    string               // name and height of the plan the current notices are about
-	upgradeAlarms [3]string            // text of each notice sent for the plan, empty when not sent
+	upgradeAlarms [4]string            // text of each notice sent for the upgrade, empty when not sent
+	lastProposed  *proposalInfo        // the upgrade proposal last seen in voting, kept while its plan is awaited
 	proposals     []proposalInfo       // proposals in their voting period
 	govAlarms     map[uint64]*govAlarm // reminders sent per proposal
 	govLegacy     bool                 // chain only answers gov v1beta1 queries
@@ -209,7 +210,8 @@ func (cc *ChainConfig) pushStatus() {
 	}
 	props := make([]dash.ProposalStatus, len(cc.proposals))
 	for i, p := range cc.proposals {
-		props[i] = dash.ProposalStatus{ID: p.ID, Title: p.Title, Ends: p.VotingEnd.Unix(), IsUpgrade: p.IsUpgrade, Voted: p.Voted}
+		props[i] = dash.ProposalStatus{ID: p.ID, Title: p.Title, Ends: p.VotingEnd.Unix(), IsUpgrade: p.IsUpgrade, Voted: p.Voted,
+			UpgradeName: p.UpgradeName, UpgradeHeight: p.UpgradeHeight}
 	}
 	var lastBlock int64
 	if !cc.lastBlockTime.IsZero() {

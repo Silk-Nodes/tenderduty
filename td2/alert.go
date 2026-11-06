@@ -335,6 +335,9 @@ func alertBody(msg *alertMsg) string {
 	body := strings.Replace(msg.message, " on "+msg.chainId, "", 1)
 	for _, r := range []struct{ from, to string }{
 		{" is open for voting until ", "\nopen for voting until "},
+		{": proposal #", "\nproposal #"},
+		{", voting ends ", "\nvoting ends "},
+		{", planned for height ", "\nplanned for height "},
 		{" closes in under ", "\ncloses in under "},
 		{" and ", "\n"},
 		{" has been down for ", "\ndown for "},

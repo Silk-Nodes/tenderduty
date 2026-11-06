@@ -1,6 +1,7 @@
 package tenderduty
 
 import (
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +83,86 @@ func TestUpgradeHeldUntilChainMoves(t *testing.T) {
 		if open != c.keep {
 			t.Errorf("planGone=%v lastBlock=%d: open=%v, want %v", c.planGone, c.lastBlock, open, c.keep)
 		}
+	}
+}
+
+func TestPlanFromProposalMessage(t *testing.T) {
+	msg, _ := (&upgrade.MsgSoftwareUpgrade{Authority: "gov", Plan: upgrade.Plan{Name: "v9", Height: 12345}}).Marshal()
+	if name, height := planFromMessage("/cosmos.upgrade.v1beta1.MsgSoftwareUpgrade", msg); name != "v9" || height != 12345 {
+		t.Errorf("v1 message: got %q %d", name, height)
+	}
+	legacy, _ := (&upgrade.SoftwareUpgradeProposal{Title: "t", Plan: upgrade.Plan{Name: "v10", Height: 777}}).Marshal() //nolint:staticcheck
+	if name, height := planFromMessage("/cosmos.upgrade.v1beta1.SoftwareUpgradeProposal", legacy); name != "v10" || height != 777 {
+		t.Errorf("legacy content: got %q %d", name, height)
+	}
+	if name, height := planFromMessage("/cosmos.gov.v1beta1.TextProposal", legacy); name != "" || height != 0 {
+		t.Errorf("text proposal should give nothing, got %q %d", name, height)
+	}
+}
+
+// drain returns the alerts queued since the last call.
+func drain(ch chan *alertMsg) []*alertMsg {
+	var out []*alertMsg
+	for {
+		select {
+		case m := <-ch:
+			out = append(out, m)
+		default:
+			return out
+		}
+	}
+}
+
+func TestUpgradeProposalThenPlan(t *testing.T) {
+	cc := &ChainConfig{name: "c", ChainId: "c-1", Alerts: AlertConfig{UpgradeAlerts: true, UpgradeNoticeHours: 24, UpgradeImminentMinutes: 60, UpgradePriority: "info"}}
+	cc.valInfo = &ValInfo{}
+	saved := td
+	td = &Config{Chains: map[string]*ChainConfig{"c": cc}, alertChan: make(chan *alertMsg, 20)}
+	defer func() { td = saved }()
+
+	ends := time.Now().Add(48 * time.Hour)
+	cc.proposals = []proposalInfo{{ID: 42, Title: "upgrade", VotingEnd: ends, IsUpgrade: true, UpgradeName: "v9", UpgradeHeight: 5000}}
+	cc.alertUpgrade()
+	got := drain(td.alertChan)
+	if len(got) != 1 || got[0].resolved || !strings.HasPrefix(got[0].message, "upgrade v9 proposed on c-1: proposal #42") {
+		t.Fatalf("proposal stage: %+v", got)
+	}
+	cc.alertUpgrade()
+	if got = drain(td.alertChan); len(got) != 0 {
+		t.Fatalf("repeat refresh sent %d alerts", len(got))
+	}
+	// the vote passes: the proposal is gone and the plan is scheduled; the scheduled notice takes over, no resolve
+	cc.proposals = nil
+	cc.upgrade = &upgrade.Plan{Name: "v9", Height: 5000}
+	cc.alertUpgrade()
+	got = drain(td.alertChan)
+	if len(got) != 1 || got[0].resolved || got[0].message != "upgrade v9 is scheduled at height 5000 on c-1" {
+		t.Fatalf("plan stage: %+v", got)
+	}
+	// the upgrade is through: one resolve
+	cc.upgrade = nil
+	cc.lastProposed = nil
+	cc.alertUpgrade()
+	got = drain(td.alertChan)
+	if len(got) != 1 || !got[0].resolved {
+		t.Fatalf("resolve: %+v", got)
+	}
+}
+
+func TestUpgradeProposalRejected(t *testing.T) {
+	cc := &ChainConfig{name: "c", ChainId: "c-1", Alerts: AlertConfig{UpgradeAlerts: true, UpgradeNoticeHours: 24, UpgradeImminentMinutes: 60}}
+	cc.valInfo = &ValInfo{}
+	saved := td
+	td = &Config{Chains: map[string]*ChainConfig{"c": cc}, alertChan: make(chan *alertMsg, 20)}
+	defer func() { td = saved }()
+	// voting ended an hour ago, no plan followed: the notice is resolved
+	cc.proposals = []proposalInfo{{ID: 7, VotingEnd: time.Now().Add(-time.Hour), IsUpgrade: true, UpgradeName: "v2", UpgradeHeight: 10}}
+	cc.alertUpgrade()
+	drain(td.alertChan)
+	cc.proposals = nil
+	cc.alertUpgrade()
+	got := drain(td.alertChan)
+	if len(got) != 1 || !got[0].resolved {
+		t.Fatalf("rejected proposal: %+v", got)
 	}
 }

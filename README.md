@@ -15,7 +15,7 @@ Tenderduty was written by [blockpane](https://github.com/blockpane), and v2 was 
 
 🔀 **Height-aware node monitoring with automatic RPC failover.** All of a chain's nodes are probed together once a minute, their block heights compared, and the one with the highest height used. A node that goes down, falls more than `lag_blocks` behind, or stops delivering blocks over its websocket is replaced by the next best node within about a minute. Taking one node down for maintenance no longer stops monitoring for that chain.
 
-⬆️ **Upgrade alerts.** Read from the x/upgrade module: a notice when a plan is scheduled, one when it is under 24 hours away and one when it is under 60 minutes away, with the time estimated from recent block times. If the chain halts at its upgrade height, the stalled alert says so. One resolve once the upgrade is through.
+⬆️ **Upgrade alerts.** A notice the moment an upgrade proposal enters its voting period, with the planned height read from the proposal, which is usually days of warning; then one when the plan is scheduled in the x/upgrade module, one when it is under 24 hours away and one when it is under 60 minutes away, with the time estimated from recent block times. A vote can close less than an hour before the upgrade height, so the proposal notice is the one that gives time to prepare. If the chain halts at its upgrade height, the stalled alert says so. One resolve once the upgrade is through.
 
 🔑 **Consensus addresses get the full set of checks.** A chain configured with a valcons address used to get signing checks only. The operator is now looked up in the bonded set, so moniker, jail state, stake, governance and voting power work for it too; consumer chains without a staking module keep the old behaviour.
 

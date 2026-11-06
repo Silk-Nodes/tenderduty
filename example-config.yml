@@ -118,9 +118,11 @@ chains:
       # Should an alert be sent if no RPC servers are responding? (Note this alarm is instantaneous with no delay)
       alert_if_no_servers: yes
 
-      # Scheduled software upgrades (from the x/upgrade module). Three notices are sent: when the plan appears,
-      # when it is under upgrade_notice_hours away, and when it is under upgrade_imminent_minutes away. The
-      # time is estimated from recent block times. All three resolve once the upgrade is applied or cancelled.
+      # Software upgrades. Four notices are sent: when an upgrade proposal enters its voting period (usually
+      # days ahead, the earliest signal there is), when the plan is scheduled in the x/upgrade module, when it
+      # is under upgrade_notice_hours away, and when it is under upgrade_imminent_minutes away. The time is
+      # estimated from recent block times. They count as one alarm and resolve once the upgrade is applied,
+      # cancelled or voted down.
       upgrade_enabled: yes
       upgrade_notice_hours: 24
       upgrade_imminent_minutes: 60

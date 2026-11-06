@@ -129,7 +129,12 @@ function uptimeCell(c) {
 }
 
 function upgradeCell(c) {
-    if (!c.upgrade) return `<span class="muted">None</span>`
+    if (!c.upgrade) {
+        // an upgrade proposal still being voted on: the plan is not scheduled yet, but the height is known
+        const p = (c.proposals || []).filter(p => p.upgrade_height).sort((a, b) => a.upgrade_height - b.upgrade_height)[0]
+        if (p) return `<span class="muted" uk-tooltip="proposal #${esc(p.id)}, vote ends ${esc(shortWhen(p.ends))}">${esc(p.upgrade_name)} @ ${num(p.upgrade_height)} proposed</span>`
+        return `<span class="muted">None</span>`
+    }
     const u = c.upgrade
     let cls = ""
     if (u.eta_seconds >= 0 && u.eta_seconds < 3600) cls = "bad"

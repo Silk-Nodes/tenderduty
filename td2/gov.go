@@ -22,6 +22,10 @@ type proposalInfo struct {
 	VotingEnd time.Time `json:"voting_end"`
 	IsUpgrade bool      `json:"is_upgrade"`
 	Voted     bool      `json:"voted"`
+	// the plan an upgrade proposal would schedule, read from its message so the upgrade can be announced while
+	// the vote is still open rather than once it has passed, which can be minutes before the upgrade height
+	UpgradeName   string `json:"upgrade_name,omitempty"`
+	UpgradeHeight int64  `json:"upgrade_height,omitempty"`
 }
 
 // govAlarm remembers the exact text sent for a proposal so the resolve carries the same text.
@@ -66,6 +70,23 @@ func isUpgrade(typeUrl string) bool {
 	return strings.Contains(typeUrl, "SoftwareUpgrade")
 }
 
+// planFromMessage reads the upgrade plan out of a MsgSoftwareUpgrade or a legacy SoftwareUpgradeProposal.
+func planFromMessage(typeUrl string, value []byte) (name string, height int64) {
+	switch {
+	case strings.HasSuffix(typeUrl, "MsgSoftwareUpgrade"):
+		m := &upgrade.MsgSoftwareUpgrade{}
+		if m.Unmarshal(value) == nil {
+			name, height = m.Plan.Name, m.Plan.Height
+		}
+	case strings.HasSuffix(typeUrl, "SoftwareUpgradeProposal"):
+		m := &upgrade.SoftwareUpgradeProposal{} //nolint:staticcheck // legacy content is what older chains carry
+		if m.Unmarshal(value) == nil {
+			name, height = m.Plan.Name, m.Plan.Height
+		}
+	}
+	return clean(name, 70), height
+}
+
 // legacyTitle reads the title from any v1beta1 proposal content. Every content type puts the title in field one,
 // so decoding as a text proposal works for all of them.
 func legacyTitle(value []byte) string {
@@ -107,9 +128,13 @@ func (cc *ChainConfig) refreshUpgrade(ctx context.Context) error {
 // refreshProposals lists proposals in their voting period and whether the validator voted on each. Chains that
 // only answer the older gov v1beta1 queries are detected on the first attempt and remembered.
 func (cc *ChainConfig) refreshProposals(ctx context.Context) error {
-	voter, err := accountAddress(cc.operator)
-	if err != nil {
-		return err
+	// an rpc-only chain has no voter to check, but its upgrade proposals are still worth announcing
+	voter := ""
+	var err error
+	if cc.operator != "" {
+		if voter, err = accountAddress(cc.operator); err != nil {
+			return err
+		}
 	}
 	var props []proposalInfo
 	if !cc.govLegacy {
@@ -127,6 +152,9 @@ func (cc *ChainConfig) refreshProposals(ctx context.Context) error {
 		return err
 	}
 	for i := range props {
+		if voter == "" {
+			continue
+		}
 		if props[i].Voted, err = cc.hasVoted(ctx, props[i].ID, voter); err != nil {
 			return err
 		}
@@ -182,6 +210,7 @@ func (cc *ChainConfig) proposalsV1(ctx context.Context) ([]proposalInfo, error) 
 		for _, m := range p.Messages {
 			if isUpgrade(m.TypeUrl) {
 				info.IsUpgrade = true
+				info.UpgradeName, info.UpgradeHeight = planFromMessage(m.TypeUrl, m.Value)
 			}
 			if m.TypeUrl != "/cosmos.gov.v1.MsgExecLegacyContent" {
 				continue
@@ -192,6 +221,7 @@ func (cc *ChainConfig) proposalsV1(ctx context.Context) ([]proposalInfo, error) 
 			}
 			if isUpgrade(legacy.Content.TypeUrl) {
 				info.IsUpgrade = true
+				info.UpgradeName, info.UpgradeHeight = planFromMessage(legacy.Content.TypeUrl, legacy.Content.Value)
 			}
 			if info.Title == "" {
 				info.Title = legacyTitle(legacy.Content.Value)
@@ -218,6 +248,9 @@ func (cc *ChainConfig) proposalsV1beta1(ctx context.Context) ([]proposalInfo, er
 		if p.Content != nil {
 			info.IsUpgrade = isUpgrade(p.Content.TypeUrl)
 			info.Title = shortTitle(legacyTitle(p.Content.Value))
+			if info.IsUpgrade {
+				info.UpgradeName, info.UpgradeHeight = planFromMessage(p.Content.TypeUrl, p.Content.Value)
+			}
 		}
 		props = append(props, info)
 	}
@@ -256,9 +289,9 @@ func (cc *ChainConfig) refreshGov() {
 			problems = append(problems, "upgrade plan: "+err.Error())
 		}
 	}
-	// no voter to check for on an rpc-only chain, and consumer chains (identified by consensus address) run
-	// without a governance module
-	if (wanted || cc.Alerts.GovAlerts) && cc.operator != "" {
+	// consumer chains (a consensus address with no operator found) run without a governance module; an rpc-only
+	// chain has no voter but its upgrade proposals are announced
+	if (wanted || cc.Alerts.GovAlerts || cc.Alerts.UpgradeAlerts) && (cc.operator != "" || cc.rpcOnly()) {
 		if err := cc.refreshProposals(ctx); err != nil {
 			problems = append(problems, "proposals: "+err.Error())
 		}
@@ -275,7 +308,7 @@ func (cc *ChainConfig) refreshGov() {
 		}
 		unvoted := 0
 		for _, p := range cc.proposals {
-			if !p.Voted {
+			if !p.Voted && cc.operator != "" {
 				unvoted++
 			}
 		}
@@ -299,51 +332,85 @@ func (cc *ChainConfig) upgradeEta() (time.Duration, bool) {
 	return time.Duration(float64(remaining) * cc.avgBlockTime * float64(time.Second)), true
 }
 
-// alertUpgrade raises up to three notices for a scheduled upgrade (scheduled, due soon, imminent) and resolves
-// them once the plan is applied or cancelled. The text of each notice is kept so the resolve matches it.
+// upgradeProposal is the upgrade proposal in its voting period, if there is one. With several, the one that
+// would come first by height.
+func (cc *ChainConfig) upgradeProposal() *proposalInfo {
+	var best *proposalInfo
+	for i := range cc.proposals {
+		p := &cc.proposals[i]
+		if p.UpgradeName != "" && (best == nil || p.UpgradeHeight < best.UpgradeHeight) {
+			best = p
+		}
+	}
+	return best
+}
+
+// proposalGrace is how long after an upgrade proposal leaves its voting period the plan it would schedule is
+// waited for before the proposal notice is resolved: a passed proposal and its plan can arrive a refresh apart.
+const proposalGrace = 15 * time.Minute
+
+// alertUpgrade raises up to four notices for an upgrade (proposed, scheduled, due soon, imminent) and resolves
+// them once the plan is applied, cancelled or voted down. The text of each notice is kept so the resolve matches
+// it. The proposed notice comes from the governance proposal while the vote is open, which is usually days
+// before the plan exists; a vote can close less than an hour before the upgrade height.
 func (cc *ChainConfig) alertUpgrade() {
 	if !cc.Alerts.UpgradeAlerts {
 		return
 	}
-	key := ""
-	if cc.upgrade != nil {
-		key = fmt.Sprintf("%s@%d", cc.upgrade.Name, cc.upgrade.Height)
+	prop := cc.upgradeProposal()
+	if prop != nil {
+		cc.lastProposed = prop
 	}
-	// the three notices share one alert id and one open alarm: each new notice takes over from the one before,
+	key := ""
+	switch {
+	case cc.upgrade != nil:
+		key = fmt.Sprintf("%s@%d", cc.upgrade.Name, cc.upgrade.Height)
+	case prop != nil:
+		key = fmt.Sprintf("proposal#%d", prop.ID)
+	case cc.lastProposed != nil && time.Since(cc.lastProposed.VotingEnd) < proposalGrace:
+		key = cc.upgradeKey // the vote just closed, its plan may still be on its way
+	}
+	// the notices share one alert id and one open alarm: each new notice takes over from the one before,
 	// PagerDuty sees one incident, and a finished upgrade resolves whichever notice is current
 	if key != cc.upgradeKey {
-		for i := len(cc.upgradeAlarms) - 1; i >= 0; i-- {
+		// a proposal that passed is not resolved, its plan takes over from it
+		passed := cc.upgrade != nil && cc.lastProposed != nil && strings.HasPrefix(cc.upgradeKey, "proposal#") &&
+			cc.lastProposed.UpgradeName == cc.upgrade.Name
+		for i := len(cc.upgradeAlarms) - 1; i >= 0 && !passed; i-- {
 			if cc.upgradeAlarms[i] != "" {
 				td.alert(cc.name, cc.upgradeAlarms[i], "info", true, cc.alertId("upgrade"))
 				break
 			}
 		}
 		alarms.forget(cc.name, cc.upgradeAlarms[:]...)
-		cc.upgradeAlarms = [3]string{}
+		cc.upgradeAlarms = [4]string{}
 		cc.upgradeKey = key
 	}
-	if cc.upgrade == nil {
+	if cc.upgrade == nil && prop == nil {
 		return
 	}
 	// the text is the de-duplication key and is saved across restarts, so it must not carry the estimated time:
 	// that drifts by a few minutes between refreshes and would turn every restart into a repeat alert.
 	// The countdown is on the dashboard.
-	p := cc.upgrade
-	eta, known := cc.upgradeEta()
-	stages := [3]struct {
+	var stages [4]struct {
 		due      bool
 		msg      string
 		severity string
-	}{
-		{true,
-			fmt.Sprintf("upgrade %s is scheduled at height %d on %s", p.Name, p.Height, cc.ChainId),
-			"info"},
-		{known && eta < time.Duration(cc.Alerts.UpgradeNoticeHours)*time.Hour,
-			fmt.Sprintf("upgrade %s on %s is due in under %d hours (height %d)", p.Name, cc.ChainId, cc.Alerts.UpgradeNoticeHours, p.Height),
-			"info"},
-		{known && eta < time.Duration(cc.Alerts.UpgradeImminentMinutes)*time.Minute,
-			fmt.Sprintf("upgrade %s on %s is due in under %d minutes (height %d)", p.Name, cc.ChainId, cc.Alerts.UpgradeImminentMinutes, p.Height),
-			cc.Alerts.UpgradePriority},
+	}
+	if prop != nil && cc.upgrade == nil {
+		stages[0].due = true
+		stages[0].msg = fmt.Sprintf("upgrade %s proposed on %s: proposal #%d, voting ends %s, planned for height %d",
+			prop.UpgradeName, cc.ChainId, prop.ID, prop.VotingEnd.UTC().Format("2006-01-02 15:04 UTC"), prop.UpgradeHeight)
+		stages[0].severity = "info"
+	}
+	if p := cc.upgrade; p != nil {
+		eta, known := cc.upgradeEta()
+		stages[1].due, stages[1].severity = true, "info"
+		stages[1].msg = fmt.Sprintf("upgrade %s is scheduled at height %d on %s", p.Name, p.Height, cc.ChainId)
+		stages[2].due, stages[2].severity = known && eta < time.Duration(cc.Alerts.UpgradeNoticeHours)*time.Hour, "info"
+		stages[2].msg = fmt.Sprintf("upgrade %s on %s is due in under %d hours (height %d)", p.Name, cc.ChainId, cc.Alerts.UpgradeNoticeHours, p.Height)
+		stages[3].due, stages[3].severity = known && eta < time.Duration(cc.Alerts.UpgradeImminentMinutes)*time.Minute, cc.Alerts.UpgradePriority
+		stages[3].msg = fmt.Sprintf("upgrade %s on %s is due in under %d minutes (height %d)", p.Name, cc.ChainId, cc.Alerts.UpgradeImminentMinutes, p.Height)
 	}
 	// one stage per refresh, so when several are already due at startup they arrive in order a minute apart
 	for i, s := range stages {
@@ -359,7 +426,7 @@ func (cc *ChainConfig) alertUpgrade() {
 // alertGov reminds about proposals the validator has not voted on, once when they are seen and again when the
 // voting period is nearly over, and resolves both once the vote is cast or the period ends.
 func (cc *ChainConfig) alertGov() {
-	if !cc.Alerts.GovAlerts {
+	if !cc.Alerts.GovAlerts || cc.operator == "" {
 		return
 	}
 	if cc.govAlarms == nil {

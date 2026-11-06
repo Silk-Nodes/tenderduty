@@ -55,7 +55,10 @@ type ProposalStatus struct {
 	Title     string `json:"title"`
 	Ends      int64  `json:"ends"` // unix seconds
 	IsUpgrade bool   `json:"is_upgrade"`
-	Voted     bool   `json:"voted"`
+	// the plan an upgrade proposal would schedule, so the dashboard can show an upgrade before the vote closes
+	UpgradeName   string `json:"upgrade_name,omitempty"`
+	UpgradeHeight int64  `json:"upgrade_height,omitempty"`
+	Voted         bool   `json:"voted"`
 }
 
 // AlertStatus is an active alarm.

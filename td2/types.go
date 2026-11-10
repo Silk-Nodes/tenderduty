@@ -117,7 +117,7 @@ type ChainConfig struct {
 	lastBlockTime  time.Time
 	lastBlockAlarm bool
 	lastBlockNum   int64
-	avgBlockTime   float64 // seconds between blocks, smoothed
+	avgBlockTime   float64 // seconds between blocks over the last blockTimeWindow blocks
 
 	upgrade       *upgrade.Plan        // scheduled upgrade from x/upgrade, nil when none
 	upgradeKey    string               // name and height of the plan the current notices are about
@@ -814,17 +814,22 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 	return c, nil
 }
 
+// clearStale drops sent alarms older than hours, except proposals and upgrades: those stay open for days and resolve
+// on their own when the vote or the plan ends, so dropping one only announces it again after the restart.
 func clearStale(alarms map[string]time.Time, what string, hasPagerduty bool, hours float64) {
 	for k := range alarms {
-		if time.Since(alarms[k]).Hours() >= hours {
-			l(fmt.Sprintf("🗑 not restoring old alarm (%v >%.2f hours) from cache - %s", alarms[k], hours, k))
+		// sent-alarm keys are chain, NUL, message; dashboard keys are the message alone
+		_, kind := alertKind(k[strings.LastIndex(k, "\x00")+1:])
+		shown := strings.ReplaceAll(k, "\x00", " ") // journald ends the line at a NUL byte
+		if time.Since(alarms[k]).Hours() >= hours && kind != "Governance" && kind != "Upgrade" {
+			l(fmt.Sprintf("🗑 not restoring old alarm (%v >%.2f hours) from cache - %s", alarms[k], hours, shown))
 			if hasPagerduty && what == "PagerDuty" {
 				l("NOTE: stale alarms may need to be manually cleared from PagerDuty!")
 			}
 			delete(alarms, k)
 			continue
 		}
-		l(fmt.Sprintf("📂 restored %s alarm state - %s", what, k))
+		l(fmt.Sprintf("📂 restored %s alarm state - %s", what, shown))
 	}
 }
 

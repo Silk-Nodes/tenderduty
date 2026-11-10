@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
 	"net/url"
@@ -32,6 +33,7 @@ type alertMsg struct {
 	chain    string
 	chainId  string
 	message  string
+	text     string // what the chat message says when it differs from message, the alarm key
 	uniqueId string
 	key      string
 
@@ -205,21 +207,33 @@ type SlackMessage struct {
 }
 
 type Attachment struct {
-	Text      string `json:"text"`
-	Color     string `json:"color"`
-	Title     string `json:"title"`
-	TitleLink string `json:"title_link"`
+	Text      string       `json:"text"`
+	Color     string       `json:"color"`
+	Title     string       `json:"title"`
+	TitleLink string       `json:"title_link"`
+	Fields    []SlackField `json:"fields,omitempty"`
+}
+
+type SlackField struct {
+	Title string `json:"title"`
+	Value string `json:"value"`
+	Short bool   `json:"short"`
 }
 
 func buildSlackMessage(msg *alertMsg) *SlackMessage {
 	_, color := severityColor(msg)
+	fields := []SlackField{{Title: "Chain", Value: msg.chainId, Short: true}}
+	if !msg.resolved {
+		fields = append(fields, SlackField{Title: "Severity", Value: msg.severity, Short: true})
+	}
 	return &SlackMessage{
 		Text: strings.TrimSpace(msg.slkMentions),
 		Attachments: []Attachment{
 			{
-				Title: alertHeading(msg),
-				Text:  slackEsc.Replace(alertBody(msg)) + "\n" + msg.chainId,
-				Color: color,
+				Title:  alertHeading(msg),
+				Text:   slackTime(slackEsc.Replace(alertBody(msg))),
+				Color:  color,
+				Fields: fields,
 			},
 		},
 	}
@@ -331,8 +345,15 @@ func alertHeading(msg *alertMsg) string {
 }
 
 // alertBody breaks the one-line message into readable lines and drops the chain id, which the heading carries.
+func (m *alertMsg) shown() string {
+	if m.text != "" {
+		return m.text
+	}
+	return m.message
+}
+
 func alertBody(msg *alertMsg) string {
-	body := strings.Replace(msg.message, " on "+msg.chainId, "", 1)
+	body := strings.Replace(msg.shown(), " on "+msg.chainId, "", 1)
 	for _, r := range []struct{ from, to string }{
 		{" is open for voting until ", "\nopen for voting until "},
 		{": proposal #", "\nproposal #"},
@@ -361,6 +382,46 @@ func severityColor(msg *alertMsg) (discord uint, slack string) {
 	return 0x3B8BE0, "#3B8BE0"
 }
 
+// utcStamp matches the "2026-11-10 17:14 UTC" times the governance notices carry.
+var utcStamp = regexp.MustCompile(`\d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC`)
+
+// stampTimes rewrites each UTC time in the body with mark, given the unix time and the original text. It runs after
+// escaping, since the escape would neutralise the markup.
+func stampTimes(body string, mark func(unix int64, utc string) string) string {
+	return utcStamp.ReplaceAllStringFunc(body, func(s string) string {
+		t, err := time.Parse("2006-01-02 15:04 UTC", s)
+		if err != nil {
+			return s
+		}
+		return mark(t.Unix(), s)
+	})
+}
+
+// discordTime uses Discord's <t:unix:f> markup, rendered in the viewer's own time zone.
+func discordTime(body string) string {
+	return stampTimes(body, func(u int64, _ string) string { return fmt.Sprintf("<t:%d:f>", u) })
+}
+
+// slackTime uses Slack's date token, rendered in the viewer's time zone with the UTC text as the fallback.
+func slackTime(body string) string {
+	return stampTimes(body, func(u int64, utc string) string {
+		return fmt.Sprintf("<!date^%d^{date_short_pretty} at {time}|%s>", u, utc)
+	})
+}
+
+// telegramText is the HTML-mode message: bold heading, body, then chain and severity, which is as close as
+// Telegram gets to the embeds; it has no viewer-local time markup, so times stay UTC.
+func telegramText(msg *alertMsg) string {
+	text := "<b>" + html.EscapeString(alertHeading(msg)) + "</b>\n" + html.EscapeString(alertBody(msg)) + "\n\nChain: " + html.EscapeString(msg.chainId)
+	if !msg.resolved {
+		text += "  Severity: " + msg.severity
+	}
+	if msg.tgMentions != "" {
+		text += "\n" + msg.tgMentions
+	}
+	return text
+}
+
 func buildDiscordMessage(msg *alertMsg) *DiscordMessage {
 	color, _ := severityColor(msg)
 	fields := []DiscordField{{Name: "Chain", Value: msg.chainId, Inline: true}}
@@ -372,7 +433,7 @@ func buildDiscordMessage(msg *alertMsg) *DiscordMessage {
 		Content:  msg.discMentions,
 		Embeds: []DiscordEmbed{{
 			Title:       alertHeading(msg),
-			Description: discordEsc.Replace(alertBody(msg)),
+			Description: discordTime(discordEsc.Replace(alertBody(msg))),
 			Color:       color,
 			Fields:      fields,
 			Timestamp:   time.Now().UTC().Format(time.RFC3339),
@@ -394,11 +455,8 @@ func notifyTg(msg *alertMsg) (err error) {
 		return
 	}
 
-	text := alertHeading(msg) + "\n" + alertBody(msg) + "\n" + msg.chainId
-	if msg.tgMentions != "" {
-		text += "\n" + msg.tgMentions
-	}
-	mc := tgbotapi.NewMessageToChannel(msg.tgChannel, text)
+	mc := tgbotapi.NewMessageToChannel(msg.tgChannel, telegramText(msg))
+	mc.ParseMode = tgbotapi.ModeHTML
 	_, err = bot.Send(mc)
 	if err != nil {
 		err = sendErr(err, msg.tgKey)
@@ -430,7 +488,7 @@ func notifyPagerduty(msg *alertMsg) (err error) {
 		Action:     action,
 		DedupKey:   msg.uniqueId,
 		Payload: &pagerduty.V2Payload{
-			Summary:  msg.message,
+			Summary:  msg.shown(),
 			Source:   msg.uniqueId,
 			Severity: msg.severity,
 		},
@@ -470,6 +528,12 @@ func deadline(msg string) string {
 
 // alert creates a universal alert and pushes it to the alertChan to be delivered to appropriate services
 func (c *Config) alert(chainName, message, severity string, resolved bool, id *string) {
+	c.alertText(chainName, message, "", severity, resolved, id)
+}
+
+// alertText is alert with a chat text of its own, so a resolve can say what happened instead of repeating the
+// alert. The message stays the alarm key for dedup, the dashboard and the saved state.
+func (c *Config) alertText(chainName, message, text, severity string, resolved bool, id *string) {
 	c.chainsMux.RLock()
 	uniq := c.Chains[chainName].ValAddress
 	if id != nil {
@@ -489,6 +553,7 @@ func (c *Config) alert(chainName, message, severity string, resolved bool, id *s
 		chain:        chainName,
 		chainId:      c.Chains[chainName].ChainId,
 		message:      message,
+		text:         text,
 		uniqueId:     uniq,
 		key:          c.Chains[chainName].Alerts.Pagerduty.ApiKey,
 		tgChannel:    c.Chains[chainName].Alerts.Telegram.Channel,

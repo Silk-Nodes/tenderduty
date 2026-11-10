@@ -289,6 +289,9 @@ func (cc *ChainConfig) monitorHealth(ctx context.Context) {
 					l("❓ refreshing signing info for", cc.ValAddress, err)
 				}
 			}
+			ctx, cancel := context.WithTimeout(td.ctx, 10*time.Second)
+			cc.measureBlockTime(ctx)
+			cancel()
 			cc.refreshGov()
 			cc.alertUpgrade()
 			cc.alertGov()

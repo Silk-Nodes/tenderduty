@@ -122,14 +122,6 @@ func (cc *ChainConfig) WsRun() {
 						if td.Prom {
 							td.statsChan <- cc.mkUpdate(metricLastBlockSeconds, time.Since(cc.lastBlockTime).Seconds(), "")
 						}
-						// smoothed block interval, used to estimate when an upgrade height will arrive
-						if d := time.Since(cc.lastBlockTime).Seconds(); d < 60 {
-							if cc.avgBlockTime == 0 {
-								cc.avgBlockTime = d
-							} else {
-								cc.avgBlockTime = 0.9*cc.avgBlockTime + 0.1*d
-							}
-						}
 					}
 					cc.lastBlockTime = time.Now()
 					cc.blocksResults = append([]int{int(signState)}, cc.blocksResults[:len(cc.blocksResults)-1]...)

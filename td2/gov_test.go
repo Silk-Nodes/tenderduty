@@ -166,3 +166,37 @@ func TestUpgradeProposalRejected(t *testing.T) {
 		t.Fatalf("rejected proposal: %+v", got)
 	}
 }
+
+func TestGovResolveText(t *testing.T) {
+	cc := &ChainConfig{name: "c", ChainId: "c-1", operator: "op", Alerts: AlertConfig{GovAlerts: true, GovFinalHours: 24, GovPriority: "info"}}
+	cc.valInfo = &ValInfo{Moniker: "val"}
+	saved := td
+	td = &Config{Chains: map[string]*ChainConfig{"c": cc}, alertChan: make(chan *alertMsg, 20)}
+	defer func() { td = saved }()
+	ends := time.Now().Add(72 * time.Hour)
+	cc.proposals = []proposalInfo{{ID: 41, Title: "t", VotingEnd: ends}, {ID: 42, Title: "u", VotingEnd: ends}}
+	cc.alertGov()
+	got := drain(td.alertChan)
+	if len(got) != 2 || got[0].text != "" {
+		t.Fatalf("reminders: %+v", got)
+	}
+	// 41 is voted on, 42 leaves the voting period without a vote
+	cc.proposals = []proposalInfo{{ID: 41, Title: "t", VotingEnd: ends, Voted: true}}
+	cc.alertGov()
+	got = drain(td.alertChan)
+	if len(got) != 2 {
+		t.Fatalf("resolves: %+v", got)
+	}
+	want := map[string]string{
+		"proposal #41 (t) on c-1 is open for voting until " + ends.UTC().Format("2006-01-02 15:04 UTC") + " and val has not voted": "val voted on proposal #41 (t) on c-1",
+		"proposal #42 (u) on c-1 is open for voting until " + ends.UTC().Format("2006-01-02 15:04 UTC") + " and val has not voted": "voting on proposal #42 (u) on c-1 closed and val did not vote",
+	}
+	for _, g := range got {
+		if !g.resolved || want[g.message] != g.text {
+			t.Fatalf("resolve %q got text %q", g.message, g.text)
+		}
+		if body := alertBody(g); strings.Contains(body, "not voted") {
+			t.Fatalf("chat body still reads as a reminder: %q", body)
+		}
+	}
+}

@@ -30,6 +30,7 @@ type proposalInfo struct {
 
 // govAlarm remembers the exact text sent for a proposal so the resolve carries the same text.
 type govAlarm struct {
+	what     string // "proposal #7 (title) on chain-1", for the resolve text
 	msg      string
 	finalMsg string
 }
@@ -319,6 +320,32 @@ func (cc *ChainConfig) refreshGov() {
 	}
 }
 
+// blockTimeWindow is how many blocks the average block time is measured over. Explorers use a window of this size,
+// so the upgrade countdown agrees with them instead of swinging with every block's arrival jitter.
+const blockTimeWindow = 10000
+
+// measureBlockTime sets avgBlockTime from the header times at the tip and blockTimeWindow blocks earlier, or as far
+// back as the node keeps. The previous value stands when the node does not answer.
+func (cc *ChainConfig) measureBlockTime(ctx context.Context) {
+	status, err := cc.client.Status(ctx)
+	if err != nil {
+		return
+	}
+	tip := status.SyncInfo.LatestBlockHeight
+	span := min(int64(blockTimeWindow), tip-status.SyncInfo.EarliestBlockHeight)
+	if span < 10 {
+		return
+	}
+	old := tip - span
+	h, err := cc.client.Header(ctx, &old)
+	if err != nil || h.Header == nil {
+		return
+	}
+	if secs := status.SyncInfo.LatestBlockTime.Sub(h.Header.Time).Seconds() / float64(span); secs > 0 {
+		cc.avgBlockTime = secs
+	}
+}
+
 // upgradeEta estimates how long until the scheduled upgrade height. The second value is false when there is not
 // enough block timing data yet.
 func (cc *ChainConfig) upgradeEta() (time.Duration, bool) {
@@ -432,20 +459,21 @@ func (cc *ChainConfig) alertGov() {
 	if cc.govAlarms == nil {
 		cc.govAlarms = make(map[uint64]*govAlarm)
 	}
-	open := make(map[uint64]bool)
+	open, voted := make(map[uint64]bool), make(map[uint64]bool)
 	for _, p := range cc.proposals {
 		if p.Voted {
+			voted[p.ID] = true
 			continue
 		}
 		open[p.ID] = true
-		a := cc.govAlarms[p.ID]
-		if a == nil {
-			a = &govAlarm{}
-			cc.govAlarms[p.ID] = a
-		}
 		kind := "proposal"
 		if p.IsUpgrade {
 			kind = "upgrade proposal"
+		}
+		a := cc.govAlarms[p.ID]
+		if a == nil {
+			a = &govAlarm{what: fmt.Sprintf("%s #%d (%s) on %s", kind, p.ID, p.Title, cc.ChainId)}
+			cc.govAlarms[p.ID] = a
 		}
 		ends := p.VotingEnd.UTC().Format("2006-01-02 15:04 UTC")
 		// both notices share one id, so PagerDuty sees one incident per proposal
@@ -467,14 +495,18 @@ func (cc *ChainConfig) alertGov() {
 		if open[pid] {
 			continue
 		}
-		// one resolve, for whichever notice is current
+		// one resolve, for whichever notice is current, worded for what happened rather than repeating the reminder
 		id := *cc.alertId(fmt.Sprintf("gov%d", pid))
+		text := fmt.Sprintf("voting on %s closed and %s did not vote", a.what, cc.valInfo.Moniker)
+		if voted[pid] {
+			text = fmt.Sprintf("%s voted on %s", cc.valInfo.Moniker, a.what)
+		}
 		switch {
 		case a.finalMsg != "":
-			td.alert(cc.name, a.finalMsg, "info", true, &id)
+			td.alertText(cc.name, a.finalMsg, text, "info", true, &id)
 			alarms.forget(cc.name, a.msg)
 		case a.msg != "":
-			td.alert(cc.name, a.msg, "info", true, &id)
+			td.alertText(cc.name, a.msg, text, "info", true, &id)
 		}
 		delete(cc.govAlarms, pid)
 	}

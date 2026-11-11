@@ -62,9 +62,24 @@ type alarmCache struct {
 	SentTgAlarms   map[string]time.Time            `json:"sent_tg_alarms"`
 	SentDiAlarms   map[string]time.Time            `json:"sent_di_alarms"`
 	SentSlkAlarms  map[string]time.Time            `json:"sent_slk_alarms"`
-	AllAlarms      map[string]map[string]time.Time `json:"sent_all_alarms"`
+	AllAlarms      map[string]map[string]alarmInfo `json:"sent_all_alarms"`
 	flappingAlarms map[string]map[string]time.Time
 	notifyMux      sync.RWMutex
+}
+
+// alarmInfo is an open alarm as the dashboard, the state file and the exporter see it.
+type alarmInfo struct {
+	Since    time.Time `json:"since"`
+	Severity string    `json:"severity,omitempty"`
+}
+
+// UnmarshalJSON also reads the bare timestamp that state files written before the severity was kept hold.
+func (a *alarmInfo) UnmarshalJSON(b []byte) error {
+	if len(b) > 0 && b[0] == '"' {
+		return json.Unmarshal(b, &a.Since)
+	}
+	type plain alarmInfo
+	return json.Unmarshal(b, (*plain)(a))
 }
 
 func (a *alarmCache) getCount(chain string) int {
@@ -109,7 +124,7 @@ var alarms = &alarmCache{
 	SentTgAlarms:   make(map[string]time.Time),
 	SentDiAlarms:   make(map[string]time.Time),
 	SentSlkAlarms:  make(map[string]time.Time),
-	AllAlarms:      make(map[string]map[string]time.Time),
+	AllAlarms:      make(map[string]map[string]alarmInfo),
 	flappingAlarms: make(map[string]map[string]time.Time),
 	notifyMux:      sync.RWMutex{},
 }
@@ -120,7 +135,7 @@ func shouldNotify(msg *alertMsg, dest notifyDest) bool {
 	var whichMap map[string]time.Time
 	var service string
 	if alarms.AllAlarms[msg.chain] == nil {
-		alarms.AllAlarms[msg.chain] = make(map[string]time.Time)
+		alarms.AllAlarms[msg.chain] = make(map[string]alarmInfo)
 	}
 	switch dest {
 	case pd:
@@ -501,8 +516,8 @@ func listAlarms(chain string) []dash.AlertStatus {
 	alarms.notifyMux.RLock()
 	defer alarms.notifyMux.RUnlock()
 	out := make([]dash.AlertStatus, 0, len(alarms.AllAlarms[chain]))
-	for msg, since := range alarms.AllAlarms[chain] {
-		out = append(out, dash.AlertStatus{Message: msg, Since: since.Unix()})
+	for msg, a := range alarms.AllAlarms[chain] {
+		out = append(out, dash.AlertStatus{Message: msg, Since: a.Since.Unix(), Severity: a.Severity})
 	}
 	// alarms that carry a deadline (governance notices) sort by it, soonest first, after the operational ones;
 	// the rest by age, then text, so the list holds still between updates
@@ -569,15 +584,19 @@ func (c *Config) alertText(chainName, message, text, severity string, resolved b
 	alarms.notifyMux.Lock()
 	defer alarms.notifyMux.Unlock()
 	if alarms.AllAlarms[chainName] == nil {
-		alarms.AllAlarms[chainName] = make(map[string]time.Time)
+		alarms.AllAlarms[chainName] = make(map[string]alarmInfo)
 	}
-	if resolved && !alarms.AllAlarms[chainName][message].IsZero() {
+	cur, open := alarms.AllAlarms[chainName][message]
+	switch {
+	case resolved && open:
 		delete(alarms.AllAlarms[chainName], message)
-		return
-	} else if resolved {
-		return
+	case resolved:
+	case open:
+		// raised again while still open: keep when it started, the severity may have been reconfigured
+		alarms.AllAlarms[chainName][message] = alarmInfo{Since: cur.Since, Severity: severity}
+	default:
+		alarms.AllAlarms[chainName][message] = alarmInfo{Since: time.Now(), Severity: severity}
 	}
-	alarms.AllAlarms[chainName][message] = time.Now()
 }
 
 // severityRank orders pagerduty severities so a channel threshold can be compared against an alert. Anything
@@ -605,6 +624,20 @@ func wants(threshold, severity string, resolved bool) bool {
 func (c *Config) alertEvent(chainName, message, severity string, id *string) {
 	c.alert(chainName, message, severity, false, id)
 	alarms.forget(chainName, message)
+}
+
+// openAlarms lists the open alarms of one kind on a chain, for sweeping the ones restored from the state file that
+// nothing running knows about any more.
+func openAlarms(chain, kind string) []string {
+	alarms.notifyMux.RLock()
+	defer alarms.notifyMux.RUnlock()
+	var out []string
+	for msg := range alarms.AllAlarms[chain] {
+		if _, k := alertKind(msg); k == kind {
+			out = append(out, msg)
+		}
+	}
+	return out
 }
 
 // forget drops alarms from the dashboard without sending a resolve.

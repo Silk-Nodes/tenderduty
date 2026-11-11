@@ -177,7 +177,8 @@ function detailPanel(c) {
     } else {
         html += `<table class="uk-table uk-table-small">`
         for (const a of c.alerts) {
-            html += `<tr><td class="mono muted" style="white-space: nowrap" uk-tooltip="${esc(when(a.since))}">${esc(shortWhen(a.since))}</td><td>${esc(a.message)}</td></tr>`
+            const sev = a.severity ? `<span class="badge ${a.severity === "critical" || a.severity === "error" ? "bad" : a.severity === "warning" ? "warn" : "muted"}">${esc(a.severity)}</span>` : ""
+            html += `<tr><td class="mono muted" style="white-space: nowrap" uk-tooltip="${esc(when(a.since))}">${esc(shortWhen(a.since))}</td><td>${sev}</td><td>${esc(a.message)}</td></tr>`
         }
         html += `</table>`
     }

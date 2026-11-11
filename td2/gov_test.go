@@ -200,3 +200,51 @@ func TestGovResolveText(t *testing.T) {
 		}
 	}
 }
+
+func TestRestoredAlarmsSwept(t *testing.T) {
+	cc := &ChainConfig{name: "c", ChainId: "c-1", operator: "op", Alerts: AlertConfig{UpgradeAlerts: true, GovAlerts: true, GovFinalHours: 24, GovPriority: "info", UpgradeNoticeHours: 24, UpgradeImminentMinutes: 60}}
+	cc.valInfo = &ValInfo{Moniker: "val"}
+	saved := td
+	td = &Config{Chains: map[string]*ChainConfig{"c": cc}, alertChan: make(chan *alertMsg, 20)}
+	defer func() { td = saved }()
+	up := "upgrade v9 is scheduled at height 10 on c-1"
+	gov := "proposal #5 (old) on c-1 is open for voting until 2026-11-01 00:00 UTC and val has not voted"
+	alarms.notifyMux.Lock()
+	alarms.AllAlarms["c"] = map[string]alarmInfo{up: {Since: time.Unix(1, 0)}, gov: {Since: time.Unix(1, 0)}}
+	alarms.notifyMux.Unlock()
+	defer alarms.forget("c", up, gov)
+	// while a refresh fails nothing is swept
+	cc.upgradeStale, cc.proposalsStale = true, true
+	cc.alertUpgrade()
+	cc.alertGov()
+	if got := drain(td.alertChan); len(got) != 0 {
+		t.Fatalf("swept on stale data: %+v", got)
+	}
+	cc.upgradeStale, cc.proposalsStale = false, false
+	cc.proposals = []proposalInfo{{ID: 6, Title: "new", VotingEnd: time.Now().Add(72 * time.Hour)}}
+	cc.alertUpgrade()
+	cc.alertGov()
+	got := drain(td.alertChan)
+	if len(got) != 3 {
+		t.Fatalf("want upgrade resolve, gov resolve and new reminder, got %+v", got)
+	}
+	for _, g := range got {
+		switch g.message {
+		case up:
+			if !g.resolved {
+				t.Fatal("upgrade alarm not resolved")
+			}
+		case gov:
+			if !g.resolved || g.text != "voting on proposal #5 (old) on c-1 has ended" || g.uniqueId != *cc.alertId("gov5") {
+				t.Fatalf("gov resolve %+v", g)
+			}
+		default:
+			if g.resolved || !strings.Contains(g.message, "#6") {
+				t.Fatalf("unexpected %+v", g)
+			}
+		}
+	}
+	if alarms.getCount("c") != 1 {
+		t.Fatalf("dashboard holds %d alarms, want the #6 reminder only", alarms.getCount("c"))
+	}
+}

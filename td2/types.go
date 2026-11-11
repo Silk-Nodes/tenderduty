@@ -119,15 +119,17 @@ type ChainConfig struct {
 	lastBlockNum   int64
 	avgBlockTime   float64 // seconds between blocks over the last blockTimeWindow blocks
 
-	upgrade       *upgrade.Plan        // scheduled upgrade from x/upgrade, nil when none
-	upgradeKey    string               // name and height of the plan the current notices are about
-	upgradeAlarms [4]string            // text of each notice sent for the upgrade, empty when not sent
-	lastProposed  *proposalInfo        // the upgrade proposal last seen in voting, kept while its plan is awaited
-	proposals     []proposalInfo       // proposals in their voting period
-	govAlarms     map[uint64]*govAlarm // reminders sent per proposal
-	govLegacy     bool                 // chain only answers gov v1beta1 queries
-	govErr        string               // last refresh problem, so it is logged once
-	stalledMsg    string               // text of the open stalled alert, so the resolve matches it
+	upgrade        *upgrade.Plan        // scheduled upgrade from x/upgrade, nil when none
+	upgradeKey     string               // name and height of the plan the current notices are about
+	upgradeAlarms  [4]string            // text of each notice sent for the upgrade, empty when not sent
+	lastProposed   *proposalInfo        // the upgrade proposal last seen in voting, kept while its plan is awaited
+	proposals      []proposalInfo       // proposals in their voting period
+	govAlarms      map[uint64]*govAlarm // reminders sent per proposal
+	govLegacy      bool                 // chain only answers gov v1beta1 queries
+	govErr         string               // last refresh problem, so it is logged once
+	upgradeStale   bool                 // the last plan refresh failed, so cc.upgrade may be out of date
+	proposalsStale bool                 // the last proposals refresh failed, so cc.proposals may be out of date
+	stalledMsg     string               // text of the open stalled alert, so the resolve matches it
 
 	statTotalSigns      float64
 	statTotalProps      float64
@@ -727,7 +729,7 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		SentTgAlarms:  make(map[string]time.Time),
 		SentDiAlarms:  make(map[string]time.Time),
 		SentSlkAlarms: make(map[string]time.Time),
-		AllAlarms:     make(map[string]map[string]time.Time),
+		AllAlarms:     make(map[string]map[string]alarmInfo),
 		notifyMux:     sync.RWMutex{},
 	}
 
@@ -765,16 +767,23 @@ func loadConfig(yamlFile, stateFile, chainConfigDirectory string, password *stri
 		if saved.Alarms.AllAlarms != nil {
 			alarms.AllAlarms = saved.Alarms.AllAlarms
 			for name, alrm := range saved.Alarms.AllAlarms {
-				clearStale(alrm, "dashboard", c.Pagerduty.Enabled, staleHours)
 				// an alarm the chain can no longer produce would never resolve: the chain left the config, or it
-				// is RPC-only now and the alarm is about its former validator
+				// is RPC-only now and the alarm is about its former validator. Old alarms go the way clearStale
+				// sends them, proposals and upgrades excepted.
 				cc := c.Chains[name]
-				for msg := range alrm {
+				for msg, a := range alrm {
 					_, kind := alertKind(msg)
 					validatorOnly := kind == "Governance" || kind == "Voting power" || kind == "Missed blocks" || kind == "Validator inactive"
-					if cc == nil || (cc.rpcOnly() && validatorOnly) {
+					longLived := kind == "Governance" || kind == "Upgrade"
+					switch {
+					case cc == nil || (cc.rpcOnly() && validatorOnly):
 						l(fmt.Sprintf("🗑 dropping restored alarm that %s can no longer resolve - %s", name, msg))
 						delete(alrm, msg)
+					case !longLived && time.Since(a.Since).Hours() >= staleHours:
+						l(fmt.Sprintf("🗑 not restoring old alarm (%v >%d hours) from cache - %s", a.Since, staleHours, msg))
+						delete(alrm, msg)
+					default:
+						l("📂 restored dashboard alarm state - " + msg)
 					}
 				}
 			}

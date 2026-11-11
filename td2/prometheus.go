@@ -43,6 +43,47 @@ const (
 	metricVotingPowerPercent
 )
 
+// alarmCollector exposes every open alarm at scrape time, one series per alarm, so a rule can match on the kind or
+// the severity without reading the dashboard state. Nothing to reset: a resolved alarm is simply absent next scrape.
+type alarmCollector struct{ desc *prometheus.Desc }
+
+func (ac alarmCollector) Describe(ch chan<- *prometheus.Desc) { ch <- ac.desc }
+
+func (ac alarmCollector) Collect(ch chan<- prometheus.Metric) {
+	type chainInfo struct{ chainId, moniker string }
+	chains := make(map[string]chainInfo)
+	td.chainsMux.RLock()
+	for name, cc := range td.Chains {
+		info := chainInfo{chainId: cc.ChainId}
+		if cc.valInfo != nil {
+			info.moniker = cc.valInfo.Moniker
+		}
+		chains[name] = info
+	}
+	td.chainsMux.RUnlock()
+	alarms.notifyMux.RLock()
+	defer alarms.notifyMux.RUnlock()
+	for name, open := range alarms.AllAlarms {
+		info, ok := chains[name]
+		if !ok {
+			continue
+		}
+		for msg, a := range open {
+			_, kind := alertKind(msg)
+			// NewConstMetric errors on a label value that is not UTF-8 where Must would panic the scrape
+			if m, err := prometheus.NewConstMetric(ac.desc, prometheus.GaugeValue, 1, name, info.chainId, info.moniker, kind, a.Severity, msg); err == nil {
+				ch <- m
+			}
+		}
+	}
+}
+
+func newAlarmCollector() alarmCollector {
+	return alarmCollector{desc: prometheus.NewDesc("tenderduty_alert",
+		"an open alarm, one series per alarm with its kind, severity and text; gone once it resolves",
+		[]string{"name", "chain_id", "moniker", "kind", "severity", "message"}, nil)}
+}
+
 type promUpdate struct {
 	metric   metricType
 	counter  float64
@@ -194,6 +235,7 @@ func prometheusExporter(ctx context.Context, updates chan *promUpdate) {
 		}
 	})
 
+	prometheus.MustRegister(newAlarmCollector())
 	promMux := http.NewServeMux()
 
 	addr := net.JoinHostPort(td.ListenAddress, strconv.Itoa(td.PrometheusListenPort))

@@ -1,6 +1,10 @@
 package tenderduty
 
 import (
+	"encoding/json"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
+	"strings"
 	"testing"
 	"time"
 )
@@ -35,11 +39,11 @@ func TestAlertFormatting(t *testing.T) {
 
 func TestListAlarmsOrder(t *testing.T) {
 	alarms.notifyMux.Lock()
-	alarms.AllAlarms["t"] = map[string]time.Time{
-		"proposal #1059 (x) on c is open for voting until 2026-11-06 22:08 UTC and v has not voted":         time.Unix(100, 0),
-		"proposal #1057 (y) on c closes in under 24 hours (2026-11-04 14:26 UTC) and v has still not voted": time.Unix(100, 0),
-		"proposal #1058 (z) on c is open for voting until 2026-11-04 14:28 UTC and v has not voted":         time.Unix(100, 0),
-		"RPC node http://a has been down for > 20 minutes on c":                                             time.Unix(200, 0),
+	alarms.AllAlarms["t"] = map[string]alarmInfo{
+		"proposal #1059 (x) on c is open for voting until 2026-11-06 22:08 UTC and v has not voted":         {Since: time.Unix(100, 0)},
+		"proposal #1057 (y) on c closes in under 24 hours (2026-11-04 14:26 UTC) and v has still not voted": {Since: time.Unix(100, 0)},
+		"proposal #1058 (z) on c is open for voting until 2026-11-04 14:28 UTC and v has not voted":         {Since: time.Unix(100, 0)},
+		"RPC node http://a has been down for > 20 minutes on c":                                             {Since: time.Unix(200, 0)},
 	}
 	alarms.notifyMux.Unlock()
 	got := listAlarms("t")
@@ -48,5 +52,46 @@ func TestListAlarmsOrder(t *testing.T) {
 		if len(got[i].Message) < len(w) || got[i].Message[:len(w)] != w {
 			t.Errorf("position %d = %q, want prefix %q", i, got[i].Message, w)
 		}
+	}
+}
+
+func TestAlarmInfoReadsOldState(t *testing.T) {
+	var m map[string]alarmInfo
+	if err := json.Unmarshal([]byte(`{"old":"2026-11-05T10:14:10Z","new":{"since":"2026-11-06T15:34:00Z","severity":"warning"}}`), &m); err != nil {
+		t.Fatal(err)
+	}
+	if m["old"].Since.Year() != 2026 || m["old"].Severity != "" || m["new"].Severity != "warning" {
+		t.Fatalf("%+v", m)
+	}
+}
+
+func TestAlarmCollector(t *testing.T) {
+	cc := &ChainConfig{name: "c", ChainId: "c-1", valInfo: &ValInfo{Moniker: "val"}}
+	saved := td
+	td = &Config{Chains: map[string]*ChainConfig{"c": cc}}
+	defer func() { td = saved }()
+	alarms.notifyMux.Lock()
+	alarms.AllAlarms["c"] = map[string]alarmInfo{"upgrade v2 is scheduled at height 10 on c-1": {Since: time.Unix(1, 0), Severity: "info"}}
+	alarms.notifyMux.Unlock()
+	defer alarms.forget("c", "upgrade v2 is scheduled at height 10 on c-1")
+	ch := make(chan prometheus.Metric, 10)
+	newAlarmCollector().Collect(ch)
+	close(ch)
+	var got []string
+	for m := range ch {
+		d := &dto.Metric{}
+		if err := m.Write(d); err != nil {
+			t.Fatal(err)
+		}
+		for _, lp := range d.Label {
+			got = append(got, lp.GetName()+"="+lp.GetValue())
+		}
+		if d.Gauge.GetValue() != 1 {
+			t.Fatalf("value %v", d.Gauge.GetValue())
+		}
+	}
+	want := "chain_id=c-1 kind=Upgrade message=upgrade v2 is scheduled at height 10 on c-1 moniker=val name=c severity=info"
+	if strings.Join(got, " ") != want {
+		t.Fatalf("labels %q", strings.Join(got, " "))
 	}
 }

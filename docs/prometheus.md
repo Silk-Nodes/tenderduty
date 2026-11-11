@@ -102,6 +102,12 @@ Count of proposals in their voting period that the validator has not voted on
 
 `tenderduty_unvoted_proposals{chain_id="chain-id",moniker="Moniker",name="Chain Name"} 1`
 
+### tenderduty_alert
+
+One series per open alarm, value 1, with the alarm's kind (`Governance`, `Upgrade`, `Missed blocks`, `Validator inactive`, `Chain stalled`, `RPC node down`, `No RPC endpoints`, `Voting power`), its severity and its text. The series disappears when the alarm resolves, so a rule such as `tenderduty_alert{severity="critical"} == 1` fires for as long as the alarm is open.
+
+`tenderduty_alert{chain_id="chain-id",kind="Governance",message="proposal #41 (title) on chain-id is open for voting until 2026-11-10 17:14 UTC and Moniker has not voted",moniker="Moniker",name="Chain Name",severity="info"} 1`
+
 ### tenderduty_voting_power_tokens
 
 Stake delegated to the validator in the chain's base denomination

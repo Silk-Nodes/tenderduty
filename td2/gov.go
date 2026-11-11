@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"math"
+	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -286,14 +288,18 @@ func (cc *ChainConfig) refreshGov() {
 	// nothing is queried that neither an alert, the dashboard nor the exporter will show
 	wanted := td.EnableDash || td.Prom
 	if wanted || cc.Alerts.UpgradeAlerts {
-		if err := cc.refreshUpgrade(ctx); err != nil {
+		err := cc.refreshUpgrade(ctx)
+		cc.upgradeStale = err != nil
+		if err != nil {
 			problems = append(problems, "upgrade plan: "+err.Error())
 		}
 	}
 	// consumer chains (a consensus address with no operator found) run without a governance module; an rpc-only
 	// chain has no voter but its upgrade proposals are announced
 	if (wanted || cc.Alerts.GovAlerts || cc.Alerts.UpgradeAlerts) && (cc.operator != "" || cc.rpcOnly()) {
-		if err := cc.refreshProposals(ctx); err != nil {
+		err := cc.refreshProposals(ctx)
+		cc.proposalsStale = err != nil
+		if err != nil {
 			problems = append(problems, "proposals: "+err.Error())
 		}
 	}
@@ -414,6 +420,9 @@ func (cc *ChainConfig) alertUpgrade() {
 		cc.upgradeKey = key
 	}
 	if cc.upgrade == nil && prop == nil {
+		if key == "" { // nothing scheduled, proposed or in its grace period
+			cc.sweepUpgradeAlarms(nil)
+		}
 		return
 	}
 	// the text is the de-duplication key and is saved across restarts, so it must not carry the estimated time:
@@ -439,6 +448,11 @@ func (cc *ChainConfig) alertUpgrade() {
 		stages[3].due, stages[3].severity = known && eta < time.Duration(cc.Alerts.UpgradeImminentMinutes)*time.Minute, cc.Alerts.UpgradePriority
 		stages[3].msg = fmt.Sprintf("upgrade %s on %s is due in under %d minutes (height %d)", p.Name, cc.ChainId, cc.Alerts.UpgradeImminentMinutes, p.Height)
 	}
+	keep := make([]string, 0, len(stages))
+	for _, s := range stages {
+		keep = append(keep, s.msg)
+	}
+	cc.sweepUpgradeAlarms(keep)
 	// one stage per refresh, so when several are already due at startup they arrive in order a minute apart
 	for i, s := range stages {
 		if s.due && cc.upgradeAlarms[i] == "" {
@@ -447,6 +461,47 @@ func (cc *ChainConfig) alertUpgrade() {
 			alarms.forget(cc.name, cc.upgradeAlarms[:i]...)
 			return
 		}
+	}
+}
+
+// sweepUpgradeAlarms resolves upgrade alarms restored from the state file that no current notice accounts for: the
+// upgrade went through, or was cancelled, while tenderduty was down. Skipped while the plan could not be read.
+func (cc *ChainConfig) sweepUpgradeAlarms(keep []string) {
+	if cc.upgradeStale {
+		return
+	}
+	for _, msg := range openAlarms(cc.name, "Upgrade") {
+		if !slices.Contains(keep, msg) && !slices.Contains(cc.upgradeAlarms[:], msg) {
+			td.alert(cc.name, msg, "info", true, cc.alertId("upgrade"))
+		}
+	}
+}
+
+// proposalNumber finds the "#N" in a governance notice.
+var proposalNumber = regexp.MustCompile(`#(\d+)`)
+
+// sweepGovAlarms resolves governance alarms restored from the state file for proposals that left their voting
+// period while tenderduty was down. Skipped while the proposals could not be read.
+func (cc *ChainConfig) sweepGovAlarms() {
+	if cc.proposalsStale {
+		return
+	}
+	for _, msg := range openAlarms(cc.name, "Governance") {
+		known := false
+		for _, a := range cc.govAlarms {
+			known = known || msg == a.msg || msg == a.finalMsg
+		}
+		if known {
+			continue
+		}
+		what := msg
+		if i := strings.Index(msg, " is open for voting"); i > 0 {
+			what = msg[:i]
+		} else if i := strings.Index(msg, " closes in under"); i > 0 {
+			what = msg[:i]
+		}
+		id := *cc.alertId("gov" + strings.TrimPrefix(proposalNumber.FindString(msg), "#"))
+		td.alertText(cc.name, msg, "voting on "+what+" has ended", "info", true, &id)
 	}
 }
 
@@ -510,6 +565,7 @@ func (cc *ChainConfig) alertGov() {
 		}
 		delete(cc.govAlarms, pid)
 	}
+	cc.sweepGovAlarms()
 }
 
 // alertVotingPower sends a one-off notice when the delegated stake moved by more than the configured share

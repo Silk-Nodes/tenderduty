@@ -63,8 +63,9 @@ type ProposalStatus struct {
 
 // AlertStatus is an active alarm.
 type AlertStatus struct {
-	Message string `json:"message"`
-	Since   int64  `json:"since"` // unix seconds
+	Message  string `json:"message"`
+	Since    int64  `json:"since"` // unix seconds
+	Severity string `json:"severity,omitempty"`
 }
 
 type LogMessage struct {
